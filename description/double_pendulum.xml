@@ -1,0 +1,58 @@
+<mujoco model="double_pendulum_pretty">
+  <!-- Explicit gravity; default is 0 0 -9.81, but we set it clearly -->
+  <option timestep="0.002" integrator="RK4" gravity="0 0 -9.81" />
+
+  <!-- Angle units & nice defaults -->
+  <compiler angle="degree" />
+
+  <!-- Simple visual assets for a clean scene -->
+  <asset>
+    <!-- Checker grid for the floor -->
+    <texture name="grid" type="2d" builtin="checker" width="512" height="512"
+             rgb1="0.92 0.92 0.92" rgb2="0.82 0.82 0.82" />
+    <material name="mat_grid" texture="grid" texrepeat="8 8" reflectance="0.0" rgba="1 1 1 1"/>
+  </asset>
+
+  <worldbody>
+    <!-- Ambient & key light for soft shadows and highlights -->
+    <light name="top_key" pos="0 0 2.5" dir="0 0 -1" diffuse="1 1 1" specular="0.2 0.2 0.2" directional="true"/>
+    <light name="fill" pos="2 -2 1.5" dir="-1 1 -0.5" diffuse="0.6 0.6 0.6" specular="0.1 0.1 0.1" directional="true"/>
+
+    <!-- Ground plane with a subtle checker grid -->
+    <geom name="floor" type="plane" size="6 6 0.1" pos="0 0 0" material="mat_grid" rgba="1 1 1 1"/>
+
+    <!-- Cinematic camera: isometric-ish view; feel free to tweak -->
+    <camera name="iso" pos="1.6 -1.6 1.0" xyaxes="0.707 0.707 0  -0.408 0.408 0.816" />
+
+    <!-- Your double pendulum -->
+    <body name="A" pos="0 0 2.5"> <!-- lift off the floor for visibility -->
+      <!-- Small Coulomb (dry) friction at joint j1 (N·m). Set to 0.0 to disable. -->
+      <joint name="j1" type="hinge" axis="0 1 0" pos="0 0 0" frictionloss="1.5"/>
+
+      <!-- Link 1: box along +X -->
+      <geom type="box" size=".5 .05 .05" pos=".5 0 0" rgba="0.9 0.2 0.2 1" density="800"/>
+
+      <body name="B" pos="1 0 0">
+        <!-- Small Coulomb (dry) friction at joint j2 (N·m). Set to 0.0 to disable. -->
+        <joint name="j2" type="hinge" axis="0 1 0" pos="0 0 0" frictionloss="1.5"/>
+
+        <!-- Link 2 -->
+        <geom type="box" size=".5 .05 .05" pos=".5 0 0" rgba="0.9 0.2 0.2 1" density="800"/>
+        
+        <!-- Optional: a tiny sphere at the tip for easier visual tracking -->
+        <geom name="tip_marker" type="sphere" size="0.03" pos="1.0 0 0" rgba="0.1 0.1 0.9 1"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <!-- Actuators (you can ignore; controls can stay zero) -->
+  <actuator>
+    <motor name="m1" joint="j1" gear="1" ctrllimited="true" ctrlrange="-5 5"/>
+    <motor name="m2" joint="j2" gear="1" ctrllimited="true" ctrlrange="-5 5"/>
+  </actuator>
+
+  <!-- Optional: start from a perturbed pose for free-swing trajectories -->
+  <keyframe>
+    <key name="rest" qpos="90 0" qvel="0 0"/>
+  </keyframe>
+</mujoco>
