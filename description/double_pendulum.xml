@@ -1,58 +1,95 @@
 <mujoco model="double_pendulum_pretty">
-  <!-- Explicit gravity; default is 0 0 -9.81, but we set it clearly -->
+  <!-- Stable, fine integration for stick–slip capture -->
   <option timestep="0.002" integrator="RK4" gravity="0 0 -9.81" />
+  <!-- Use radians to match ML training conventions -->
+  <compiler angle="radian" coordinate="local" />
 
-  <!-- Angle units & nice defaults -->
-  <compiler angle="degree" />
+  <!-- ===== Presets for loss regimes ===== -->
+  <default>
+    <!-- Baseline geometry/inertia style -->
+    <default class="geom_base">
+      <geom friction="0.8 0.1 0.01" rgba="0.9 0.2 0.2 1" density="800"/>
+    </default>
 
-  <!-- Simple visual assets for a clean scene -->
+    <!-- IDEAL: no damping, no stiction -->
+    <default class="ideal">
+      <joint damping="0.0" frictionloss="0.0" armature="0.0"/>
+    </default>
+
+    <!-- VISCOUS only: smooth dissipation (good for SINDy/HNN) -->
+    <default class="viscous">
+      <joint damping="0.04" frictionloss="0.0" armature="0.0"/>
+    </default>
+
+    <!-- STICTION sets: add dry-friction threshold + small damping -->
+    <default class="stiction_low">
+      <joint damping="0.02" frictionloss="0.03" armature="0.0"/>
+    </default>
+    <default class="stiction_med">
+      <joint damping="0.02" frictionloss="0.07" armature="0.0"/>
+    </default>
+    <default class="stiction_high">
+      <joint damping="0.02" frictionloss="0.12" armature="0.0"/>
+    </default>
+  </default>
+
+  <!-- ===== Assets (unchanged visuals) ===== -->
   <asset>
-    <!-- Checker grid for the floor -->
     <texture name="grid" type="2d" builtin="checker" width="512" height="512"
              rgb1="0.92 0.92 0.92" rgb2="0.82 0.82 0.82" />
     <material name="mat_grid" texture="grid" texrepeat="8 8" reflectance="0.0" rgba="1 1 1 1"/>
   </asset>
 
   <worldbody>
-    <!-- Ambient & key light for soft shadows and highlights -->
     <light name="top_key" pos="0 0 2.5" dir="0 0 -1" diffuse="1 1 1" specular="0.2 0.2 0.2" directional="true"/>
     <light name="fill" pos="2 -2 1.5" dir="-1 1 -0.5" diffuse="0.6 0.6 0.6" specular="0.1 0.1 0.1" directional="true"/>
-
-    <!-- Ground plane with a subtle checker grid -->
     <geom name="floor" type="plane" size="6 6 0.1" pos="0 0 0" material="mat_grid" rgba="1 1 1 1"/>
-
-    <!-- Cinematic camera: isometric-ish view; feel free to tweak -->
     <camera name="iso" pos="1.6 -1.6 1.0" xyaxes="0.707 0.707 0  -0.408 0.408 0.816" />
 
-    <!-- Your double pendulum -->
-    <body name="A" pos="0 0 2.5"> <!-- lift off the floor for visibility -->
-      <!-- Small Coulomb (dry) friction at joint j1 (N·m). Set to 0.0 to disable. -->
-      <joint name="j1" type="hinge" axis="0 1 0" pos="0 0 0" frictionloss="1.5"/>
+    <!-- ===== Double pendulum =====
+         Pick ONE regime by setting the class on each joint: ideal | viscous | stiction_low|med|high
+    -->
+    <body name="A" pos="0 0 2.5">
+      <!-- Choose regime here -->
+      <joint name="j1" type="hinge" class="stiction_med" axis="0 1 0" pos="0 0 0"/>
 
-      <!-- Link 1: box along +X -->
-      <geom type="box" size=".5 .05 .05" pos=".5 0 0" rgba="0.9 0.2 0.2 1" density="800"/>
+      <!-- Link 1 -->
+      <geom class="geom_base" type="box" size=".5 .05 .05" pos=".5 0 0"/>
 
       <body name="B" pos="1 0 0">
-        <!-- Small Coulomb (dry) friction at joint j2 (N·m). Set to 0.0 to disable. -->
-        <joint name="j2" type="hinge" axis="0 1 0" pos="0 0 0" frictionloss="1.5"/>
+        <!-- Same regime as j1 (keep consistent for datasets) -->
+        <joint name="j2" type="hinge" class="stiction_med" axis="0 1 0" pos="0 0 0"/>
 
-        <!-- Link 2 -->
-        <geom type="box" size=".5 .05 .05" pos=".5 0 0" rgba="0.9 0.2 0.2 1" density="800"/>
-        
-        <!-- Optional: a tiny sphere at the tip for easier visual tracking -->
+        <!-- Link 2 + tip marker -->
+        <geom class="geom_base" type="box" size=".5 .05 .05" pos=".5 0 0"/>
         <geom name="tip_marker" type="sphere" size="0.03" pos="1.0 0 0" rgba="0.1 0.1 0.9 1"/>
       </body>
     </body>
   </worldbody>
 
-  <!-- Actuators (you can ignore; controls can stay zero) -->
+  <!-- Actuators (zero by default; keep for probing if needed) -->
   <actuator>
     <motor name="m1" joint="j1" gear="1" ctrllimited="true" ctrlrange="-5 5"/>
     <motor name="m2" joint="j2" gear="1" ctrllimited="true" ctrlrange="-5 5"/>
   </actuator>
 
-  <!-- Optional: start from a perturbed pose for free-swing trajectories -->
+  <!-- ===== Sensors for data logging =====
+       - jointpos: qpos (radians)
+       - jointvel: qvel (rad/s)
+       - actuatorfrc: motor torques (for validation; will be ~0 in passive trials)
+       You will read constraint torques (incl. frictionloss) in Python: data.qfrc_constraint
+  -->
+  <sensor>
+    <jointpos name="t1" joint="j1"/>
+    <jointpos name="t2" joint="j2"/>
+    <jointvel name="w1" joint="j1"/>
+    <jointvel name="w2" joint="j2"/>
+    <actuatorfrc name="u1" actuator="m1"/>
+    <actuatorfrc name="u2" actuator="m2"/>
+  </sensor>
+
+  <!-- Convenient start pose (radians now) -->
   <keyframe>
-    <key name="rest" qpos="90 0" qvel="0 0"/>
+    <key name="rest" qpos="1.5707963 0.0" qvel="0 0"/>
   </keyframe>
 </mujoco>
