@@ -15,7 +15,7 @@ import mujoco
 
 # ======================= USER OPTIONS =======================
 XML_PATH = "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/description/double_pendulum.xml"
-REGIME = 1  # <<< 1=IDEAL, 2=VISCOUS, 3=STICTION
+REGIME = 3  # <<< 1=IDEAL, 2=VISCOUS, 3=STICTION
 
 # Preset values (per-DoF)
 DAMPING_VISCOUS = 0.04
@@ -32,7 +32,7 @@ Q1_DEG = 270.0
 Q2_DEG = 80.0
 Q1D    = 0.0
 Q2D    = 0.0
-SIM_TIME = 5.0  # seconds
+SIM_TIME = 8.0  # seconds
 # ==========================================================
 
 
@@ -93,7 +93,7 @@ def main():
     set_initial_state(model, data, Q1_DEG, Q2_DEG, Q1D, Q2D)
 
     # Output paths (CSV + JSON metadata)
-    out_dir = os.path.dirname(XML_PATH)
+    out_dir = "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data"
     out_csv = os.path.join(out_dir, f"double_pendulum_traj_{tag}.csv")
     out_meta = os.path.join(out_dir, f"double_pendulum_traj_{tag}.json")
 

@@ -1,0 +1,60 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.so
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+*.env
+*.venv
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# =========================
+# Project-specific (keep code, ignore heavy artifacts)
+# =========================
+# ALL datasets, models, metrics, plots, eval dumps live here → ignore entirely
+data/
+!data/.gitkeep
+
+# Typical training/eval outputs
+outputs/
+results/
+runs/
+logs/
+wandb/
+lightning_logs/
+mlruns/
+checkpoints/
+*.ckpt
+
+# Generic caches / scratch
+*.log
+*.tmp
+*.cache
+tmp/
+scratch/
+
+data/

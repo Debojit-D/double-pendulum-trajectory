@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Hard-coded evaluation for the saved SINDy model (double pendulum).
+
+- Loads model from MODEL_DIR
+- Evaluates all CSVs listed in MANIFEST (under DATA_DIR)
+- Simulates with solve_ivp (Radau) and computes RMSE(q), RMSE(dq), derivative MSE
+- Saves:
+    eval_all/eval_metrics.csv
+    eval_all/<csvstem>_timeseries.png
+    eval_all/top_features.png
+"""
+
+from __future__ import annotations
+from pathlib import Path
+import json
+import sys
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")  # headless-safe
+import matplotlib.pyplot as plt
+
+# ===================== HARD-CODED PATHS / OPTIONS =====================
+MODEL_DIR  = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal1/sindy_model")
+DATA_DIR   = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal1")
+MANIFEST   = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal1/double_pendulum_manifest_ideal.json")
+OUT_DIR    = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal1/sindy_model/eval_all")
+
+# Simulation / metrics knobs (kept aligned with your training defaults)
+SIM_METHOD    = "Radau"     # ["RK45","Radau","BDF","LSODA"]
+SIM_RTOL      = 1e-4
+SIM_ATOL      = 1e-6
+SIM_MAX_STEP  = 0.02        # will be passed if your SINDy.simulate supports it
+ANGLE_WRAP    = True        # wrap q to (-pi, pi] for error calc
+ANGLE_IDX     = (0, 1)      # which states are angles
+SAVGOL_WIN    = 31          # for ddq reconstruction (same as train)
+SAVGOL_ORDER  = 3
+DECIM_STRIDE  = 1           # decimate signals before sim
+BURNIN_SEC    = 0.0         # ignore first seconds when computing RMSE
+MAKE_PLOTS    = True
+# Optional guard-rails (if your SINDy.simulate supports them)
+CLIP_Q        = np.pi
+CLIP_DQ       = 50.0
+WRAP_ANGLES_DURING_SIM = True
+# =====================================================================
+
+# --- Make project root importable so we can reuse training helpers ---
+# This mirrors your train_sindy.py behavior.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.model_training.sindy import SINDyRegressor, SINDyConfig
+# Reuse the exact same loaders/wrappers so results match training
+from src.training.train_sindy import _build_X_Xdot_from_csv, _wrap_to_pi
+
+
+def _collect_files(data_dir: Path, manifest: Path) -> list[Path]:
+    """Gather CSV list from manifest (preferred)."""
+    if not manifest.exists():
+        raise FileNotFoundError(f"Manifest not found: {manifest}")
+    meta = json.loads(manifest.read_text())
+    files = [data_dir / r["csv"] for r in meta.get("runs", [])]
+    if not files:
+        raise RuntimeError(f"No runs listed in manifest: {manifest}")
+    return files
+
+
+def _load_model(model_dir: Path) -> SINDyRegressor:
+    coef = np.load(model_dir / "coef.npy")
+    names = (model_dir / "feature_names.txt").read_text().strip().splitlines()
+    cfg_json = json.loads((model_dir / "config.json").read_text())
+
+    cfg = SINDyConfig(
+        poly_degree=int(cfg_json["poly_degree"]),
+        trig_harmonics=int(cfg_json["trig_harmonics"]),
+        threshold_lambda=float(cfg_json["threshold_lambda"]),
+        max_stlsq_iter=int(cfg_json["max_stlsq_iter"]),
+        use_savgol_for_xdot=False,
+        savgol_window=int(cfg_json["savgol_window"]),
+        savgol_polyorder=int(cfg_json["savgol_polyorder"]),
+        normalize_columns=bool(cfg_json["normalize_columns"]),
+        include_bias=bool(cfg_json["include_bias"]),
+        backend="numpy",
+        device=None,
+    )
+    model = SINDyRegressor(cfg)
+    model.coef_ = coef
+    model.feature_names_ = names
+    model.n_state_ = 4
+    return model
+
+
+def main():
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    model = _load_model(MODEL_DIR)
+    files = _collect_files(DATA_DIR, MANIFEST)
+
+    rows = []
+    for p in files:
+        Xh, Xdot_h, th = _build_X_Xdot_from_csv(
+            p, angle_wrap=ANGLE_WRAP,
+            savgol_window=SAVGOL_WIN,
+            savgol_polyorder=SAVGOL_ORDER,
+            stride=max(1, DECIM_STRIDE),
+            debug_dump=None
+        )
+
+        # decimated signals (already applied in loader via stride)
+        x0 = Xh[0]
+        th_sim = th
+
+        # Build kwargs for simulate with graceful fallback if your class
+        # doesn't support the extended signature.
+        sim_kwargs = dict(method=SIM_METHOD, rtol=SIM_RTOL, atol=SIM_ATOL)
+        extended_kwargs = dict(
+            max_step=SIM_MAX_STEP,
+            wrap_angles=WRAP_ANGLES_DURING_SIM,
+            angle_idx=ANGLE_IDX,
+            clip_q=CLIP_Q,
+            clip_dq=CLIP_DQ,
+        )
+
+        # Try extended signature first (your train script used it and succeeded).
+        y = None
+        try:
+            y = model.simulate(x0, th_sim, **sim_kwargs, **extended_kwargs)
+        except TypeError:
+            # Fallback: old signature (method/rtol/atol only)
+            y = model.simulate(x0, th_sim, **sim_kwargs)
+
+        # Errors (optionally burn-in)
+        rel_t = th_sim - th_sim[0]
+        k0 = int(np.searchsorted(rel_t, BURNIN_SEC)) if BURNIN_SEC > 0 else 0
+
+        true_q = _wrap_to_pi(Xh[:, :2]) if ANGLE_WRAP else Xh[:, :2]
+        pred_q = _wrap_to_pi(y[:, :2])  if ANGLE_WRAP else y[:, :2]
+
+        rmse_q  = float(np.sqrt(np.mean((pred_q[k0:] - true_q[k0:])**2)))
+        rmse_dq = float(np.sqrt(np.mean((y[k0:, 2:] - Xh[k0:, 2:])**2)))
+        f_pred = model.predict_derivative(Xh)
+        deriv_mse = float(np.mean((f_pred[k0:] - Xdot_h[k0:])**2))
+
+        rows.append([p.name, rmse_q, rmse_dq, deriv_mse, len(th_sim)])
+        print(f"[EVAL] {p.name}: RMSE(q)={rmse_q:.4e}, RMSE(dq)={rmse_dq:.4e}, d/dt MSE={deriv_mse:.4e}")
+
+        if MAKE_PLOTS:
+            fig = plt.figure(figsize=(11, 8))
+            ax = plt.subplot(2,2,1); ax.plot(th_sim, true_q[:,0], label="q1 true"); ax.plot(th_sim, pred_q[:,0], '--', label="q1 pred"); ax.set_title("q1"); ax.legend()
+            ax = plt.subplot(2,2,2); ax.plot(th_sim, true_q[:,1], label="q2 true"); ax.plot(th_sim, pred_q[:,1], '--', label="q2 pred"); ax.set_title("q2"); ax.legend()
+            ax = plt.subplot(2,2,3); ax.plot(th_sim, Xh[:,2],    label="dq1 true"); ax.plot(th_sim, y[:,2],      '--', label="dq1 pred"); ax.set_title("dq1"); ax.legend()
+            ax = plt.subplot(2,2,4); ax.plot(th_sim, Xh[:,3],    label="dq2 true"); ax.plot(th_sim, y[:,3],      '--', label="dq2 pred"); ax.set_title("dq2"); ax.legend()
+            fig.suptitle(p.name)
+            fig.tight_layout()
+            fig.savefig(OUT_DIR / f"{p.stem}_timeseries.png", dpi=160)
+            plt.close(fig)
+
+    # Save summary CSV
+    header = "csv,rmse_q,rmse_dq,derivative_mse,steps"
+    arr = np.array(rows, dtype=object)
+    np.savetxt(OUT_DIR / "eval_metrics.csv", arr, fmt="%s", delimiter=",", header=header, comments="")
+    print(f"[✓] Wrote evaluation summary: {OUT_DIR/'eval_metrics.csv'}")
+
+    # Top features bar-plot
+    try:
+        Xi = model.coef_
+        mags = np.abs(Xi).sum(axis=1)  # total magnitude across states
+        idx = np.argsort(mags)[::-1][:20]
+        labels = [model.feature_names_[i] for i in idx]
+        fig = plt.figure(figsize=(12,5))
+        plt.bar(np.arange(len(idx)), mags[idx])
+        plt.xticks(np.arange(len(idx)), labels, rotation=60, ha='right')
+        plt.title("Top 20 features by |coef| sum across states")
+        fig.tight_layout()
+        fig.savefig(OUT_DIR / "top_features.png", dpi=160)
+        plt.close(fig)
+    except Exception as e:
+        print(f"[WARN] feature barplot skipped: {e}")
+
+    print(f"[✓] Plots & metrics saved to: {OUT_DIR}")
+
+if __name__ == "__main__":
+    main()

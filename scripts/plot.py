@@ -13,7 +13,7 @@ L1 = 1.0
 L2 = 1.0
 BASE_X = 0.0
 BASE_Z = 2.5
-BASE_RELATIVE = True   # True → plot in base frame; False → world frame
+BASE_RELATIVE = False   # True → plot in base frame; False → world frame
 
 def load_csv(csv_path):
     """
@@ -84,16 +84,16 @@ def plot_tip_with_overlay(data, base_relative, out_path=None, show=True):
     plt.legend(loc="best")
     plt.tight_layout()
 
-    if out_path:
-        plt.savefig(out_path, dpi=200)
-        print(f"[✓] Saved plot to: {out_path}")
+    # if out_path:
+    #     plt.savefig(out_path, dpi=200)
+    #     print(f"[✓] Saved plot to: {out_path}")
     if show:
         plt.show()
     plt.close()
 
 def main():
     csv_path = sys.argv[1] if len(sys.argv) > 1 else \
-        "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/description/double_pendulum_traj_ideal.csv"
+        "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/description/double_pendulum_traj_stiction.csv"
     if not os.path.isfile(csv_path):
         print(f"[x] CSV not found: {csv_path}"); sys.exit(1)
 
