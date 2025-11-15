@@ -1,0 +1,156 @@
+<mujoco model="double_pendulum_3regimes">
+  <!-- Stable, fine integration for stick–slip capture -->
+  <option timestep="0.002" integrator="RK4" gravity="0 0 -9.81" />
+  <!-- Use radians to match ML training conventions -->
+  <compiler angle="radian" coordinate="local" />
+
+  <!-- ===== Presets for loss regimes ===== -->
+  <default>
+    <!-- Baseline geometry/inertia style -->
+    <default class="geom_base">
+      <geom friction="0.8 0.1 0.01" rgba="0.9 0.2 0.2 1" density="800"/>
+    </default>
+
+    <!-- IDEAL: no damping, no stiction -->
+    <default class="ideal">
+      <joint damping="0.0" frictionloss="0.0" armature="0.0"/>
+    </default>
+
+    <!-- VISCOUS only: smooth dissipation (unused here, kept for future) -->
+    <default class="viscous">
+      <joint damping="0.04" frictionloss="0.0" armature="0.0"/>
+    </default>
+
+    <!-- STICTION sets: (unused here, kept for future) -->
+    <default class="stiction_low">
+      <joint damping="0.02" frictionloss="0.03" armature="0.0"/>
+    </default>
+    <default class="stiction_med">
+      <joint damping="0.02" frictionloss="0.07" armature="0.0"/>
+    </default>
+    <default class="stiction_high">
+      <joint damping="0.02" frictionloss="0.12" armature="0.0"/>
+    </default>
+  </default>
+
+  <!-- ===== Assets (unchanged visuals) ===== -->
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" width="512" height="512"
+             rgb1="0.92 0.92 0.92" rgb2="0.82 0.82 0.82" />
+    <material name="mat_grid" texture="grid" texrepeat="8 8" reflectance="0.0" rgba="1 1 1 1"/>
+  </asset>
+
+  <worldbody>
+    <light name="top_key" pos="0 0 2.5" dir="0 0 -1"
+           diffuse="1 1 1" specular="0.2 0.2 0.2" directional="true"/>
+    <light name="fill" pos="2 -2 1.5" dir="-1 1 -0.5"
+           diffuse="0.6 0.6 0.6" specular="0.1 0.1 0.1" directional="true"/>
+    <geom name="floor" type="plane" size="6 6 0.1" pos="0 0 0"
+          material="mat_grid" rgba="1 1 1 1"/>
+
+    <!-- Camera pulled back a bit to see all three -->
+    <camera name="iso" pos="3.5 -3.0 2.0"
+            xyaxes="0.707 0.707 0  -0.408 0.408 0.816" />
+
+        <!-- Pendulum A (FRONT) -->
+    <body name="pend_A" pos="0 -0.25 2.5">
+      <joint name="joint1_A" type="hinge" class="ideal" axis="0 1 0" pos="0 0 0"/>
+
+      <!-- Link 1 -->
+      <geom class="geom_base" type="box" size=".5 .05 .05" pos=".5 0 0"
+            rgba="0.9 0.2 0.2 1"/>  <!-- red -->
+
+      <body name="pend_A_link2" pos="1 0 0">
+        <joint name="joint2_A" type="hinge" class="ideal" axis="0 1 0" pos="0 0 0"/>
+
+        <geom class="geom_base" type="box" size=".5 .05 .05" pos=".5 0 0"
+              rgba="0.9 0.2 0.2 1"/>
+        <geom name="tip_marker_A" type="sphere" size="0.03" pos="1.0 0 0" rgba="0.9 0.1 0.1 1"/>
+      </body>
+    </body>
+
+    <!-- Pendulum B (MIDDLE) -->
+    <body name="pend_B" pos="0 0 2.5">
+      <joint name="joint1_B" type="hinge" class="ideal" axis="0 1 0" pos="0 0 0"/>
+
+      <geom class="geom_base" type="box" size=".5 .05 .05" pos=".5 0 0"
+            rgba="0.2 0.9 0.2 1"/>  <!-- green -->
+
+      <body name="pend_B_link2" pos="1 0 0">
+        <joint name="joint2_B" type="hinge" class="ideal" axis="0 1 0" pos="0 0 0"/>
+
+        <geom class="geom_base" type="box" size=".5 .05 .05" pos=".5 0 0"
+              rgba="0.2 0.9 0.2 1"/>
+        <geom name="tip_marker_B" type="sphere" size="0.03" pos="1.0 0 0" rgba="0.1 0.9 0.1 1"/>
+      </body>
+    </body>
+
+    <!-- Pendulum C (BACK) -->
+    <body name="pend_C" pos="0 0.25 2.5">
+      <joint name="joint1_C" type="hinge" class="ideal" axis="0 1 0" pos="0 0 0"/>
+
+      <geom class="geom_base" type="box" size=".5 .05 .05" pos=".5 0 0"
+            rgba="0.2 0.2 0.9 1"/>  <!-- blue -->
+
+      <body name="pend_C_link2" pos="1 0 0">
+        <joint name="joint2_C" type="hinge" class="ideal" axis="0 1 0" pos="0 0 0"/>
+
+        <geom class="geom_base" type="box" size=".5 .05 .05" pos=".5 0 0"
+              rgba="0.2 0.2 0.9 1"/>
+        <geom name="tip_marker_C" type="sphere" size="0.03" pos="1.0 0 0" rgba="0.1 0.1 0.9 1"/>
+      </body>
+    </body>
+
+
+  </worldbody>
+
+  <!-- Actuators for each pendulum (zero by default; can be used later) -->
+  <actuator>
+    <!-- A -->
+    <motor name="m1_A" joint="joint1_A" gear="1" ctrllimited="true" ctrlrange="-5 5"/>
+    <motor name="m2_A" joint="joint2_A" gear="1" ctrllimited="true" ctrlrange="-5 5"/>
+
+    <!-- B -->
+    <motor name="m1_B" joint="joint1_B" gear="1" ctrllimited="true" ctrlrange="-5 5"/>
+    <motor name="m2_B" joint="joint2_B" gear="1" ctrllimited="true" ctrlrange="-5 5"/>
+
+    <!-- C -->
+    <motor name="m1_C" joint="joint1_C" gear="1" ctrllimited="true" ctrlrange="-5 5"/>
+    <motor name="m2_C" joint="joint2_C" gear="1" ctrllimited="true" ctrlrange="-5 5"/>
+  </actuator>
+
+  <!-- ===== Sensors for data logging (per pendulum) ===== -->
+  <sensor>
+    <!-- Pendulum A -->
+    <jointpos    name="t1_A" joint="joint1_A"/>
+    <jointpos    name="t2_A" joint="joint2_A"/>
+    <jointvel    name="w1_A" joint="joint1_A"/>
+    <jointvel    name="w2_A" joint="joint2_A"/>
+    <actuatorfrc name="u1_A" actuator="m1_A"/>
+    <actuatorfrc name="u2_A" actuator="m2_A"/>
+
+    <!-- Pendulum B -->
+    <jointpos    name="t1_B" joint="joint1_B"/>
+    <jointpos    name="t2_B" joint="joint2_B"/>
+    <jointvel    name="w1_B" joint="joint1_B"/>
+    <jointvel    name="w2_B" joint="joint2_B"/>
+    <actuatorfrc name="u1_B" actuator="m1_B"/>
+    <actuatorfrc name="u2_B" actuator="m2_B"/>
+
+    <!-- Pendulum C -->
+    <jointpos    name="t1_C" joint="joint1_C"/>
+    <jointpos    name="t2_C" joint="joint2_C"/>
+    <jointvel    name="w1_C" joint="joint1_C"/>
+    <jointvel    name="w2_C" joint="joint2_C"/>
+    <actuatorfrc name="u1_C" actuator="m1_C"/>
+    <actuatorfrc name="u2_C" actuator="m2_C"/>
+  </sensor>
+
+  <!-- Convenient start pose: same (q1,q2) for all 3 pendulums -->
+  <!-- Order is [joint1_A, joint2_A, joint1_B, joint2_B, joint1_C, joint2_C] -->
+  <keyframe>
+    <key name="rest_all"
+         qpos="1.5707963 0.0  1.5707963 0.0  1.5707963 0.0"
+         qvel="0 0 0 0 0 0"/>
+  </keyframe>
+</mujoco>

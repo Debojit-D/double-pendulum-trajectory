@@ -1,28 +1,61 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Hamiltonian Neural Network (HNN) for double-pendulum style systems.
 
-- Baseline mode: a standard MLP directly predicts time-derivatives dx.
-- HNN mode: a scalar Hamiltonian network H(q, p) is learned; dynamics are
-            computed via the canonical map: z = [q, p], ẋ = J ∇H, with
-            J = [ 0  I; -I  0 ].
+Based on:
+  Greydanus et al., "Hamiltonian Neural Networks", NeurIPS 2019.
 
-Public API:
-    HNN(n_elements, hidden_dims, num_layers, baseline=False, nonlinearity='softplus')
-        .forward(x) -> dx
-        .energy(x)  -> H(x)   (only in HNN mode)
+Two modes:
+  1) baseline=True
+       - Plain MLP that directly regresses time-derivatives:
+           f_theta : x = [q, p] -> dx = [q_dot, p_dot]
+  2) baseline=False (default)
+       - Learn a scalar Hamiltonian H_theta(q, p).
+       - Dynamics are given by the canonical Hamiltonian flow:
+           z = [q, p] in R^{2n}
+           grad H = ∇_z H(z) = [∂H/∂q, ∂H/∂p]
+           q_dot =  ∂H/∂p
+           p_dot = -∂H/∂q
+         so dx = [q_dot, p_dot] = J ∇H, with
+           J = [  0  I ;
+                -I  0 ]
+
+Extensions:
+  - separable=True:
+        H(q, p) = T_theta(p) + V_theta(q)
+    with two MLPs (one for kinetic, one for potential energy).
+  - dissipative=True:
+        dx = J ∇H(z) + λ * g_theta(z)
+    where g_theta is an unconstrained vector field
+    (useful for viscous / friction regimes).
+
+Public API
+----------
+    HNN(
+        n_elements,
+        hidden_dims=200,
+        num_layers=3,
+        baseline=False,
+        nonlinearity='softplus',
+        separable=False,
+        dissipative=False,
+        dissipation_scale=1.0,
+    )
+
+        .forward(x) -> dx          # [q̇, ṗ]
+        .energy(x)  -> H(x)        # scalar energy per sample (HNN mode only)
+
     make_optimizer(...)
-    train_step(model, optimizer, criterion, x, dx)
-    eval_step(model, criterion, x, dx)
+    train_step(...)
+    eval_step(...)
 
-Assumptions:
+Assumptions
+-----------
 - Input x is shaped (B, 2*n_elements), ordered as [q (n), p (n)].
 - Output dx is shaped (B, 2*n_elements), ordered as [q̇ (n), ṗ (n)].
 
-Notes:
-- We prefer `torch.func.jacrev` + `torch.vmap` for a clean ∇H(x).
-  If unavailable, we fallback to autograd on a batch sum (works for both train/eval).
-- Keep this file self-contained with minimal training utilities; the
-  full pipeline remains in your trainer.
+You should handle dataset normalization and batching in your trainer.
 """
 
 from __future__ import annotations
@@ -30,7 +63,7 @@ from typing import List, Sequence, Union, Optional, Tuple
 import torch
 import torch.nn as nn
 
-# Optional: torch.func (PyTorch ≥ 2.0); we gate usage dynamically
+# Optional: torch.func (PyTorch ≥ 2.0)
 try:
     from torch.func import jacrev, vmap  # type: ignore
     _HAS_TORCH_FUNC = True
@@ -38,9 +71,7 @@ except Exception:
     _HAS_TORCH_FUNC = False
 
 # ---------------------------------------------------------------------
-# Small MLP builder (keeps your existing .utils.MLP usable if desired)
-# If you already have src/models/utils.py::MLP(in_dim, hidden_dims, num_layers, out_dim, nonlinearity)
-# feel free to import and swap here. This local version is safe and explicit.
+# Small MLP builder
 # ---------------------------------------------------------------------
 
 _ACTS = {
@@ -60,6 +91,14 @@ def _as_list(hidden_dims: Union[int, Sequence[int]]) -> List[int]:
 class MLP(nn.Module):
     """
     Simple MLP with configurable depth/width/activation.
+
+    Args
+    ----
+    in_dim      : input dimension
+    hidden_dims : int or list[int] — hidden layer widths
+    num_layers  : number of hidden layers if hidden_dims is an int
+    out_dim     : output dimension
+    nonlinearity: activation name ('softplus', 'relu', 'tanh', ...)
     """
     def __init__(
         self,
@@ -71,30 +110,31 @@ class MLP(nn.Module):
     ):
         super().__init__()
         hidden = _as_list(hidden_dims)
-        act = _ACTS.get(nonlinearity.lower(), nn.Softplus)
+        act_cls = _ACTS.get(nonlinearity.lower(), nn.Softplus)
 
-        # If num_layers includes input+output, infer the number of hidden layers
-        # Otherwise, trust the provided hidden list
-        if num_layers is not None and num_layers >= 2:
-            # build a uniform stack if hidden dims given as int
-            if len(hidden) == 1 and num_layers > 2:
-                hidden = [hidden[0]] * (num_layers - 1)  # (#hidden layers)
+        # If a single hidden size is given, repeat it num_layers times
+        if len(hidden) == 1 and num_layers is not None and num_layers > 0:
+            hidden = hidden * num_layers
+
+        dims = [in_dim] + hidden + [out_dim]
         layers: List[nn.Module] = []
-        d_prev = in_dim
-        for h in hidden:
-            layers += [nn.Linear(d_prev, h), act()]
-            d_prev = h
-        layers += [nn.Linear(d_prev, out_dim)]
+        for d_in, d_out in zip(dims[:-2], dims[1:-1]):
+            layers.append(nn.Linear(d_in, d_out))
+            layers.append(act_cls())
+        layers.append(nn.Linear(dims[-2], dims[-1]))  # final linear, no activation
         self.net = nn.Sequential(*layers)
 
         # Kaiming init for hidden; small output init for stability
-        for m in self.net:
+        for i, m in enumerate(self.net):
             if isinstance(m, nn.Linear):
-                nn.init.kaiming_uniform_(m.weight, a=0.01)
-                nn.init.zeros_(m.bias)
-        if isinstance(self.net[-1], nn.Linear):
-            nn.init.uniform_(self.net[-1].weight, -1e-3, 1e-3)
-            nn.init.zeros_(self.net[-1].bias)
+                if i < len(self.net) - 1:
+                    # hidden layers
+                    nn.init.kaiming_uniform_(m.weight, a=0.01)
+                    nn.init.zeros_(m.bias)
+                else:
+                    # output layer: very small init
+                    nn.init.uniform_(m.weight, -1e-3, 1e-3)
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
@@ -106,22 +146,37 @@ class MLP(nn.Module):
 
 class HNN(nn.Module):
     """
-    Hamiltonian Neural Network:
-      - baseline=False: learn scalar H(q,p); return dx = J ∇H
-      - baseline=True : direct regression dx = f_MLP(x)
+    Hamiltonian Neural Network.
+
+    Modes
+    -----
+    baseline = False (default):
+        - Learn scalar Hamiltonian H(q, p).
+        - dx = [q̇, ṗ] = [∂H/∂p, -∂H/∂q] (canonical Hamiltonian flow).
+    baseline = True:
+        - Plain MLP: dx = f_theta(x) with no physics structure.
 
     Args
     ----
     n_elements : int
-        The DoF per (q or p). For double pendulum, n_elements=2.
+        DoF per generalized coordinate (q) or momentum (p). For a
+        double pendulum, n_elements = 2, x = [q1, q2, p1, p2].
     hidden_dims : int | List[int]
-        Hidden sizes.
+        Hidden sizes for internal networks.
     num_layers : int
-        Depth control (see MLP note).
+        Depth control for MLPs (number of hidden layers if hidden_dims is int).
     baseline : bool
-        If True, use direct dx regression. If False (default), learn Hamiltonian.
+        If True, use direct dx regression. Otherwise, learn Hamiltonian.
     nonlinearity : str
         Activation name ('softplus', 'relu', 'tanh', ...).
+    separable : bool
+        If True, use H(q, p) = T(p) + V(q) with two MLPs,
+        which often stabilizes training and improves interpretability.
+    dissipative : bool
+        If True, add an unconstrained dissipative term g_theta(x)
+        to the canonical Hamiltonian flow.
+    dissipation_scale : float
+        Scalar λ multiplying the dissipative term.
     """
 
     def __init__(
@@ -131,12 +186,18 @@ class HNN(nn.Module):
         num_layers: int = 3,
         baseline: bool = False,
         nonlinearity: str = "softplus",
+        separable: bool = False,
+        dissipative: bool = False,
+        dissipation_scale: float = 1.0,
     ):
         super().__init__()
         assert n_elements >= 1, "n_elements must be >= 1"
         self.n = int(n_elements)
         self.d = 2 * self.n
         self.baseline = bool(baseline)
+        self.separable = bool(separable)
+        self.dissipative = bool(dissipative)
+        self.dissipation_scale = float(dissipation_scale)
 
         if self.baseline:
             # Direct dx regressor: R^{2n} -> R^{2n}
@@ -148,14 +209,110 @@ class HNN(nn.Module):
                 nonlinearity=nonlinearity,
             )
         else:
-            # Scalar Hamiltonian: R^{2n} -> R
-            self.H_net = MLP(
-                in_dim=self.d,
-                hidden_dims=hidden_dims,
-                num_layers=num_layers,
-                out_dim=1,
-                nonlinearity=nonlinearity,
-            )
+            # Hamiltonian networks
+            if self.separable:
+                # H(q,p) = T(p) + V(q)
+                self.T_net = MLP(
+                    in_dim=self.n,
+                    hidden_dims=hidden_dims,
+                    num_layers=num_layers,
+                    out_dim=1,
+                    nonlinearity=nonlinearity,
+                )
+                self.V_net = MLP(
+                    in_dim=self.n,
+                    hidden_dims=hidden_dims,
+                    num_layers=num_layers,
+                    out_dim=1,
+                    nonlinearity=nonlinearity,
+                )
+            else:
+                # Generic scalar H(q,p)
+                self.H_net = MLP(
+                    in_dim=self.d,
+                    hidden_dims=hidden_dims,
+                    num_layers=num_layers,
+                    out_dim=1,
+                    nonlinearity=nonlinearity,
+                )
+
+            # Optional dissipative field g_theta(x)
+            if self.dissipative:
+                self.g_net = MLP(
+                    in_dim=self.d,
+                    hidden_dims=hidden_dims,
+                    num_layers=num_layers,
+                    out_dim=self.d,
+                    nonlinearity=nonlinearity,
+                )
+            else:
+                self.g_net = None
+
+    # --------- Internal Hamiltonian helpers ---------
+
+    def _hamiltonian(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute H(x) for a batch.
+
+        x : (B, 2n)
+        returns H : (B, 1)
+        """
+        assert not self.baseline, "Hamiltonian is undefined for baseline=True"
+
+        if self.separable:
+            q, p = x.split(self.n, dim=-1)  # each (B, n)
+            T = self.T_net(p)              # (B, 1)
+            V = self.V_net(q)              # (B, 1)
+            return T + V
+        else:
+            return self.H_net(x)           # (B, 1)
+
+    def _H_single(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Scalar H(z) for a single state z in R^{2n}.
+
+        z : (2n,)
+        returns scalar tensor ()
+        """
+        H = self._hamiltonian(z.unsqueeze(0))  # (1, 1)
+        return H.squeeze(0).squeeze(-1)
+
+    def _grad_H(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute ∇H(x) for a batch.
+
+        Parameters
+        ----------
+        x : (B, 2n)
+
+        Returns
+        -------
+        grad_H : (B, 2n)
+            grad_H[b] = ∇_z H(z_b)
+        """
+        if self.baseline:
+            raise RuntimeError("grad_H is undefined for baseline=True")
+
+        if _HAS_TORCH_FUNC:
+            # jacrev on scalar function H(z) with z in R^{2n}
+            # then vmap over the batch dimension
+            grad_fun = jacrev(self._H_single)         # (2n,) -> (2n,)
+            grad = vmap(grad_fun)(x)                  # (B, 2n)
+            return grad
+
+        # Fallback: autograd on batch sum. Works train+eval.
+        # We re-run the forward with x requiring grad.
+        x_req = x.requires_grad_(True)
+        H = self._hamiltonian(x_req).squeeze(-1)      # (B,)
+        H_sum = H.sum()
+        grad = torch.autograd.grad(
+            H_sum,
+            x_req,
+            create_graph=self.training,  # keep graph in train for higher-order grads
+            retain_graph=True,
+            only_inputs=True,
+        )[0]                                          # (B, 2n)
+        return grad
 
     # --------- Public API ---------
 
@@ -176,55 +333,39 @@ class HNN(nn.Module):
         if self.baseline:
             return self.dx_net(x)
 
-        # HNN path: dx = J ∇H
-        grad_H = self._grad_H(x)  # (B, 2n)
-        q_grad, p_grad = grad_H.split(self.n, dim=-1)
-        # canonical map: q̇ =  ∂H/∂p,  ṗ = -∂H/∂q
+        # Hamiltonian flow: dx = J ∇H
+        grad_H = self._grad_H(x)               # (B, 2n)
+        q_grad, p_grad = grad_H.split(self.n, dim=-1)  # each (B, n)
+
+        # Canonical equations:
+        #   q̇ =  ∂H/∂p
+        #   ṗ = -∂H/∂q
         q_dot = p_grad
         p_dot = -q_grad
-        return torch.cat([q_dot, p_dot], dim=-1)
+        dx = torch.cat([q_dot, p_dot], dim=-1)  # (B, 2n)
+
+        # Optional dissipative term
+        if self.g_net is not None and self.dissipation_scale != 0.0:
+            g = self.g_net(x)
+            dx = dx + self.dissipation_scale * g
+
+        return dx
 
     @torch.no_grad()
     def energy(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Return Hamiltonian H(x). Only valid for HNN mode.
+        Return Hamiltonian H(x) as a 1D tensor of length B.
+
+        Only valid for HNN mode (baseline=False).
         """
         if self.baseline:
             raise RuntimeError("energy() only available when baseline=False.")
-        H = self.H_net(x)
+        H = self._hamiltonian(x)  # (B, 1)
         return H.squeeze(-1)
-
-    # --------- Internals ---------
-
-    def _grad_H(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Compute ∇H(x) for a batch. Uses torch.func when available,
-        otherwise falls back to autograd over a batch-summed scalar.
-        """
-        if self.baseline:
-            raise RuntimeError("grad_H is undefined for baseline=True")
-
-        if _HAS_TORCH_FUNC:
-            # jacrev returns Jacobian of shape (B, out_dim, in_dim) for batched x
-            # with out_dim==1, squeeze to (B, in_dim)
-            J = vmap(jacrev(self.H_net))(x)      # (B, 1, d)
-            grad = J.squeeze(1)                  # (B, d)
-            return grad
-
-        # Fallback: autograd on batch sum. Works in both train/eval.
-        # Keep graph in training for higher-order ops.
-        x_req = x.requires_grad_(True)
-        H = self.H_net(x_req).squeeze(-1)       # (B,)
-        H_sum = H.sum()
-        grad = torch.autograd.grad(
-            H_sum, x_req,
-            create_graph=self.training, retain_graph=True, only_inputs=True
-        )[0]                                      # (B, d)
-        return grad
 
 
 # ---------------------------------------------------------------------
-# Minimal training helpers (optional)
+# Minimal training helpers
 # ---------------------------------------------------------------------
 
 def make_optimizer(
@@ -236,7 +377,12 @@ def make_optimizer(
     """
     Convenience Adam optimizer with light weight decay default.
     """
-    return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay, betas=betas)
+    return torch.optim.Adam(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
+        betas=betas,
+    )
 
 
 def train_step(
@@ -248,13 +394,17 @@ def train_step(
     grad_clip_norm: Optional[float] = 1.0,
 ) -> float:
     """
-    One training step:
-      loss = criterion(model(x), dx)
+    One training step with derivative supervision:
 
-    You can augment this with energy regularizers or smoothness penalties outside.
+        loss = criterion(model(x), dx)
+
+    You can augment this with:
+      - energy regularizers (e.g., ||H(x_0) - H(target)||^2),
+      - smoothness penalties on H or dx,
+    outside this function.
     """
     model.train()
-    pred = model(x.requires_grad_(True))
+    pred = model(x)
     loss = criterion(pred, dx)
 
     optimizer.zero_grad(set_to_none=True)
@@ -274,7 +424,8 @@ def eval_step(
 ) -> float:
     """
     Evaluation step (no grad):
-      loss = criterion(model(x), dx)
+
+        loss = criterion(model(x), dx)
     """
     model.eval()
     pred = model(x)
@@ -283,7 +434,7 @@ def eval_step(
 
 
 # ---------------------------------------------------------------------
-# Quick self-test (optional). Guarded by __main__.
+# Quick self-test
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
     torch.manual_seed(42)
@@ -291,15 +442,42 @@ if __name__ == "__main__":
     B = 8
 
     # Random test batch: x = [q, p]
-    x = torch.randn(B, 2 * n, requires_grad=True)
+    x = torch.randn(B, 2 * n)
 
-    # HNN mode
-    hnn = HNN(n_elements=n, hidden_dims=[128, 128], num_layers=3, baseline=False)
+    print("=== HNN mode (generic H) ===")
+    hnn = HNN(
+        n_elements=n,
+        hidden_dims=[128, 128],
+        num_layers=2,
+        baseline=False,
+        separable=False,
+        dissipative=True,
+        dissipation_scale=0.1,
+    )
     dx = hnn(x)
-    print("HNN dx shape:", dx.shape, "H shape:", hnn.energy(x).shape)
+    H = hnn.energy(x)
+    print("dx shape:", dx.shape, "H shape:", H.shape)
 
-    # Baseline mode
-    base = HNN(n_elements=n, hidden_dims=256, num_layers=3, baseline=True)
+    print("\n=== HNN mode (separable H = T(p)+V(q)) ===")
+    hnn_sep = HNN(
+        n_elements=n,
+        hidden_dims=128,
+        num_layers=2,
+        baseline=False,
+        separable=True,
+        dissipative=False,
+    )
+    dx_sep = hnn_sep(x)
+    H_sep = hnn_sep.energy(x)
+    print("dx shape:", dx_sep.shape, "H shape:", H_sep.shape)
+
+    print("\n=== Baseline (no physics) ===")
+    base = HNN(
+        n_elements=n,
+        hidden_dims=256,
+        num_layers=3,
+        baseline=True,
+    )
     dx_b = base(x)
     print("Baseline dx shape:", dx_b.shape)
 
@@ -309,4 +487,4 @@ if __name__ == "__main__":
     target = torch.randn_like(dx)
     tr_loss = train_step(hnn, opt, loss_fn, x, target)
     te_loss = eval_step(hnn, loss_fn, x, target)
-    print(f"train={tr_loss:.3e}  eval={te_loss:.3e}")
+    print(f"\ntrain={tr_loss:.3e}  eval={te_loss:.3e}")

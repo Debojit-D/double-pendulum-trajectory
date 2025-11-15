@@ -5,11 +5,22 @@ Train a SINDy model on double-pendulum trajectories.
 
 Data expected:
 - CSV columns: t,q1,q2,dq1,dq2,tip_x,tip_y,tip_z,tip_x_rel,tip_z_rel,elbow_x,elbow_z,step_idx
-- (Optionally) a manifest JSON listing runs -> CSV filenames.
+  (If ddq1,ddq2 also exist from MuJoCo, they are IGNORED in this script.)
 
 State/derivative:
     X    = [q1, q2, dq1, dq2]
-    Xdot = [dq1, dq2, ddq1, ddq2]   (ddq from Savitzky–Golay on q)
+    Xdot = [dq1, dq2, ddq1, ddq2]   (ddq is ALWAYS reconstructed from q via Savitzky–Golay)
+
+This script:
+- builds X, Xdot by:
+    * loading t, q1, q2, dq1, dq2
+    * wrapping q to (-pi,pi] if angle_wrap=True
+    * estimating ddq from q with a 2nd-derivative Savitzky–Golay filter
+    * clamping each run to the first T_MAX_SECONDS seconds
+- concatenates all runs (except last K held-out runs)
+- fits SINDy with a physics-aware library (use_physics_library=True, angle_idx=(0,1))
+- optionally performs a lambda-sweep to pick the sparsity threshold
+- evaluates on held-out runs via rollout using SINDyRegressor.simulate()
 
 Outputs:
 - out_dir/
@@ -57,9 +68,9 @@ T_MAX_SECONDS = 5.0
 
 # ===================== DEFAULTS (safe & robust) =====================
 DEFAULTS = {
-    "data_dir": "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal1",
-    "manifest": "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal1/double_pendulum_manifest_ideal.json",
-    "poly_degree": 0,          # You can try 2 as well
+    "data_dir": "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal2",
+    "manifest": "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal2/double_pendulum_manifest_ideal.json",
+    "poly_degree": 0,          # You can try 2 as well; keep 0 for pure physics-library
     "trig_harmonics": 0,       # Keep 0 unless you patch class to support trig–poly cross terms
     # Leave lam=None to enable lambda-sweep below:
     "lam": None,
@@ -85,9 +96,11 @@ DEFAULTS = {
 
 REQ_COLS = ["t", "q1", "q2", "dq1", "dq2"]
 
+
 def _wrap_to_pi(a: np.ndarray) -> np.ndarray:
     """Wrap angles to (-pi, pi]."""
     return (a + np.pi) % (2 * np.pi) - np.pi
+
 
 def _ensure_finite(arr: np.ndarray, name: str, ctx: str = "", dump_dir: Optional[Path] = None):
     """Raise with location if arr has NaN/Inf; optionally dump to disk."""
@@ -103,15 +116,24 @@ def _ensure_finite(arr: np.ndarray, name: str, ctx: str = "", dump_dir: Optional
             msg += f" Dumped to: {dump_dir/(name.replace(' ', '_') + '.npy')}"
         raise ValueError(msg)
 
+
 def _read_csv(csv_path: Path) -> Dict[str, np.ndarray]:
-    """Load one trajectory CSV into dict of arrays."""
+    """
+    Load one trajectory CSV into dict of arrays.
+
+    NOTE:
+    - We only *require* t, q1, q2, dq1, dq2.
+    - If the CSV also has ddq1, ddq2 from MuJoCo, we IGNORE them.
+      This script always reconstructs ddq from q using Savitzky–Golay.
+    """
     arr = np.genfromtxt(csv_path, delimiter=",", names=True, dtype=float)
-    # Ensure column presence
+    # Ensure required columns
     for c in REQ_COLS:
         if c not in arr.dtype.names:
             raise ValueError(f"[DATA] Missing required column '{c}' in {csv_path}")
     data = {name: arr[name] for name in arr.dtype.names}
     return data
+
 
 def _robust_savgol_window(T: int, requested: int, poly: int) -> int:
     """
@@ -136,32 +158,46 @@ def _robust_savgol_window(T: int, requested: int, poly: int) -> int:
         win = 5
     return win
 
-def _estimate_ddq(dq: np.ndarray, t: np.ndarray, win: int, poly: int) -> np.ndarray:
-    """Savitzky–Golay differentiation on dq to get ddq (per state)."""
+
+def _estimate_ddq_from_q(q: np.ndarray, t: np.ndarray, win: int, poly: int) -> np.ndarray:
+    """
+    Savitzky–Golay second derivative on q to get ddq.
+
+    This is *deliberately* preferred over:
+        - finite differences on dq, or
+        - directly using logged ddq1, ddq2
+    because it is smoother and keeps training/eval pipelines consistent.
+    """
     dt = float(np.mean(np.diff(t)))
     if not np.all(np.diff(t) > 0):
         raise ValueError("[TIME] t must be strictly increasing for SavGol differentiation.")
     win_robust = _robust_savgol_window(len(t), win, poly)
-    ddq = savgol_filter(dq, window_length=win_robust, polyorder=poly,
-                        deriv=1, delta=dt, axis=0, mode="interp")
+    ddq = savgol_filter(
+        q,
+        window_length=win_robust,
+        polyorder=poly,
+        deriv=2,
+        delta=dt,
+        axis=0,
+        mode="interp",
+    )
     return ddq
 
-def _estimate_ddq_from_q(q: np.ndarray, t: np.ndarray, win: int, poly: int) -> np.ndarray:
-    """Savitzky–Golay second derivative on q to get ddq (less noisy than diff of dq)."""
-    dt = float(np.mean(np.diff(t)))
-    win_robust = _robust_savgol_window(len(t), win, poly)
-    ddq = savgol_filter(q, window_length=win_robust, polyorder=poly,
-                        deriv=2, delta=dt, axis=0, mode="interp")
-    return ddq
 
+def _build_X_Xdot_from_csv(
+    csv_path: Path,
+    angle_wrap: bool,
+    savgol_window: int,
+    savgol_polyorder: int,
+    stride: int = 1,
+    debug_dump: Optional[Path] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build X, Xdot, t from one CSV file with strict checks, then clamp to T_MAX_SECONDS.
 
-def _build_X_Xdot_from_csv(csv_path: Path,
-                           angle_wrap: bool,
-                           savgol_window: int,
-                           savgol_polyorder: int,
-                           stride: int = 1,
-                           debug_dump: Optional[Path] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build X, Xdot, t from one CSV file with strict checks, then clamp to T_MAX_SECONDS."""
+    X    = [q1, q2, dq1, dq2]
+    Xdot = [dq1, dq2, ddq1, ddq2], where ddq is reconstructed from q via Savitzky–Golay.
+    """
     d = _read_csv(csv_path)
     t = d["t"].astype(float)
 
@@ -180,7 +216,7 @@ def _build_X_Xdot_from_csv(csv_path: Path,
     if len(t) < 6:
         raise ValueError(f"[LENGTH] {csv_path} too short for SavGol: T={len(t)} (need ≥6)")
 
-    # Derivative: ddq from q (2nd derivative)
+    # Derivative: ddq from q (2nd derivative, smoother than diff(dq))
     ddq = _estimate_ddq_from_q(q, t, savgol_window, max(3, savgol_polyorder))
 
     # Sanity: no NaN/Inf in raw channels
@@ -219,19 +255,21 @@ def _build_X_Xdot_from_csv(csv_path: Path,
         return X[sl], Xdot[sl], t[sl]
     return X, Xdot, t
 
+
 def _dataset_stats(X: np.ndarray, Xdot: np.ndarray, name: str = "train"):
     def stats(v):
         return dict(min=float(np.min(v)), max=float(np.max(v)),
                     mean=float(np.mean(v)), std=float(np.std(v)))
     S = {
-        f"{name}_q1":  stats(X[:, 0]),
-        f"{name}_q2":  stats(X[:, 1]),
-        f"{name}_dq1": stats(X[:, 2]),
-        f"{name}_dq2": stats(X[:, 3]),
+        f"{name}_q1":   stats(X[:, 0]),
+        f"{name}_q2":   stats(X[:, 1]),
+        f"{name}_dq1":  stats(X[:, 2]),
+        f"{name}_dq2":  stats(X[:, 3]),
         f"{name}_ddq1": stats(Xdot[:, 2]),
         f"{name}_ddq2": stats(Xdot[:, 3]),
     }
     return S
+
 
 def _load_dataset(
     data_dir: Path,
@@ -264,8 +302,11 @@ def _load_dataset(
     for p in tqdm(train_paths, desc="Loading training CSVs"):
         try:
             X, Xdot, t = _build_X_Xdot_from_csv(
-                p, angle_wrap=angle_wrap, savgol_window=savgol_window,
-                savgol_polyorder=savgol_polyorder, stride=stride,
+                p,
+                angle_wrap=angle_wrap,
+                savgol_window=savgol_window,
+                savgol_polyorder=savgol_polyorder,
+                stride=stride,
                 debug_dump=(debug_dir if debug else None),
             )
         except Exception as e:
@@ -287,8 +328,10 @@ def _load_dataset(
 
     return X_all, Xdot_all, t_all, train_paths, held_out
 
+
 def _nnz(Xi: np.ndarray) -> int:
     return int(np.sum(np.abs(Xi) > 0))
+
 
 def _print_equations(feature_names: List[str], Xi: np.ndarray) -> str:
     """
@@ -362,9 +405,11 @@ def main():
                     help="Enable verbose checks and dump matrices on failure")
     
     # --- Simulation / evaluation controls ---
-    ap.add_argument("--sim-method", type=str, default="Radau",
-                    choices=["RK45", "Radau", "BDF", "LSODA"],
-                    help="IVP solver for held-out rollout.")
+    ap.add_argument(
+        "--sim-method", type=str, default="Radau",
+        choices=["RK45", "Radau", "BDF", "LSODA"],
+        help="IVP solver for held-out rollout."
+    )
     ap.add_argument("--sim-rtol", type=float, default=1e-4, help="Relative tolerance for solve_ivp.")
     ap.add_argument("--sim-atol", type=float, default=1e-6, help="Absolute tolerance for solve_ivp.")
     ap.add_argument("--sim-max-step", type=float, default=0.02, help="Max integrator step (seconds).")
@@ -406,8 +451,6 @@ def main():
               "NOT appear unless you modify the class to include trig–poly cross terms.")
 
     # Warn & auto-fix duplicate-bias issue in current class:
-    # If include_bias=True and poly_degree>0, the class will include TWO bias columns (one explicit,
-    # one from the polynomial block). We avoid this by disabling include_bias here.
     if args.include_bias and args.poly_degree > 0:
         print("[WARN] Detected include_bias=True with poly_degree>0. "
               "The current SINDy class will add TWO bias columns (ill-conditioned). "
@@ -416,7 +459,8 @@ def main():
 
     # Load dataset (concat many runs) and keep last K for eval
     X, Xdot, t_all, train_paths, held_out_paths = _load_dataset(
-        data_dir=data_dir, manifest=manifest,
+        data_dir=data_dir,
+        manifest=manifest,
         angle_wrap=args.angle_wrap,
         savgol_window=args.savgol_window,
         savgol_polyorder=args.savgol_polyorder,
@@ -462,7 +506,7 @@ def main():
         cfg.device = None
         base_reg = SINDyRegressor(cfg)
 
-    # If torch+cuda requested but not available, warn loudly (class will already choose cpu)
+    # If torch+cuda requested but not available, warn loudly
     if cfg.backend == "torch" and (cfg.device is None or str(cfg.device).lower() == "cuda"):
         try:
             import torch  # type: ignore
@@ -485,7 +529,7 @@ def main():
         t_tr, t_val = t_all[:-T_val], t_all[-T_val:]
         Xdot_tr, Xdot_val = Xdot[:-T_val], Xdot[-T_val:]
 
-        # Build libraries once (use class’s internal builder for parity)
+        # Build libraries once
         try:
             Theta_tr, _ = base_reg._build_library(X_tr)
             Theta_val, _ = base_reg._build_library(X_val)
@@ -539,13 +583,16 @@ def main():
             try:
                 # STLSQ on chosen backend
                 if cfg.backend == "numpy":
-                    Xi = base_reg._stlsq_numpy(Theta_tr_s, Xdot_tr, lam=float(lam),
-                                               max_iter=cfg.max_stlsq_iter)
+                    Xi = base_reg._stlsq_numpy(
+                        Theta_tr_s, Xdot_tr, lam=float(lam),
+                        max_iter=cfg.max_stlsq_iter
+                    )
                 else:
-                    Xi = base_reg._stlsq_torch(Theta_tr_s, Xdot_tr, lam=float(lam),
-                                               max_iter=cfg.max_stlsq_iter, device=cfg.device)
+                    Xi = base_reg._stlsq_torch(
+                        Theta_tr_s, Xdot_tr, lam=float(lam),
+                        max_iter=cfg.max_stlsq_iter, device=cfg.device
+                    )
             except Exception as e:
-                # Dump and re-raise with context
                 if args.debug:
                     np.save(debug_dir / f"Xi_fail_lambda_{lam:.2e}.npy", np.array([[]]))
                     np.save(debug_dir / f"Theta_tr_s_lambda_{lam:.2e}.npy", Theta_tr_s)
@@ -572,8 +619,13 @@ def main():
 
         # Save sweep curve
         sweep_arr = np.c_[np.array(sweep_vals), np.array(val_err), np.array(nnz_list)]
-        np.savetxt(out_dir / "lambda_sweep.csv",
-                   sweep_arr, delimiter=",", header="lambda,val_error,nnz", comments="")
+        np.savetxt(
+            out_dir / "lambda_sweep.csv",
+            sweep_arr,
+            delimiter=",",
+            header="lambda,val_error,nnz",
+            comments="",
+        )
         (out_dir / "selected_lambda.txt").write_text(f"{chosen_lambda:.6e}\n")
 
     # =========================
@@ -623,7 +675,8 @@ def main():
     if held_out_paths:
         for p in tqdm(held_out_paths, desc="Evaluating held-out runs"):
             Xh, Xdot_h, th = _build_X_Xdot_from_csv(
-                p, angle_wrap=args.angle_wrap,
+                p,
+                angle_wrap=args.angle_wrap,
                 savgol_window=args.savgol_window,
                 savgol_polyorder=args.savgol_polyorder,
                 stride=max(1, args.stride),
@@ -645,7 +698,7 @@ def main():
             else:
                 k0 = 0
 
-            # Build kwargs for SINDy.simulate (uses the new guard-rail signature)
+            # Build kwargs for SINDy.simulate
             sim_kwargs = dict(
                 method=args.sim_method,
                 rtol=float(args.sim_rtol),
@@ -659,7 +712,6 @@ def main():
 
             # Try chosen method, then fall back if needed
             try_methods = [args.sim_method]
-            # sensible fallback order
             for m in ["Radau", "BDF", "LSODA", "RK45"]:
                 if m not in try_methods:
                     try_methods.append(m)
@@ -670,8 +722,11 @@ def main():
                 try:
                     sim_kwargs["method"] = m
                     y_sim = sindy.simulate(x0, th_sim, **sim_kwargs)
-                    print(f"[SIM] {p.name}: succeeded with method={m}, "
-                          f"rtol={sim_kwargs['rtol']}, atol={sim_kwargs['atol']}, max_step={sim_kwargs['max_step']}")
+                    print(
+                        f"[SIM] {p.name}: succeeded with method={m}, "
+                        f"rtol={sim_kwargs['rtol']}, atol={sim_kwargs['atol']}, "
+                        f"max_step={sim_kwargs['max_step']}"
+                    )
                     break
                 except Exception as e:
                     last_err = e
@@ -683,7 +738,7 @@ def main():
                     np.save(debug_dir / f"heldout_t_{p.name}.npy", th)
                 raise RuntimeError(f"[SIM] simulate() failed on held-out file {p.name}: {last_err}")
 
-            # angle wrap for error (match periodicity): wrap both true & pred for q
+            # angle wrap for error: wrap both true & pred for q
             true_q = _wrap_to_pi(Xh_sim[:, :2])
             pred_q = _wrap_to_pi(y_sim[:, :2])
 
@@ -691,7 +746,7 @@ def main():
             rmse_q  = float(np.sqrt(np.mean((pred_q[k0:] - true_q[k0:])**2)))
             rmse_dq = float(np.sqrt(np.mean((y_sim[k0:, 2:] - Xh_sim[k0:, 2:])**2)))
 
-            # Derivative MSE on held-out (one-step derivative fit quality)
+            # Derivative MSE on held-out
             try:
                 f_pred = sindy.predict_derivative(Xh_sim)
                 deriv_mse = float(np.mean((f_pred[k0:] - Xdot_h_sim[k0:]) ** 2))
@@ -724,7 +779,6 @@ def main():
             })
             print(f"[EVAL] {p.name}: RMSE(q)={rmse_q:.4e}, RMSE(dq)={rmse_dq:.4e}, d/dt MSE={deriv_mse:.4e}")
 
-
     # Save config + metrics
     config_to_save = dict(
         poly_degree=cfg.poly_degree,
@@ -752,7 +806,8 @@ def main():
     print(f"[✓] nnz={metrics['nnz_total']}  lambda={chosen_lambda:.3e}  backend={cfg.backend}"
           + (f" device={cfg.device}" if cfg.backend == "torch" else ""))
     if metrics["heldout_runs"]:
-        print(f"[✓] Held-out results saved in metrics.json")
+        print("[✓] Held-out results saved in metrics.json")
+
 
 if __name__ == "__main__":
     main()

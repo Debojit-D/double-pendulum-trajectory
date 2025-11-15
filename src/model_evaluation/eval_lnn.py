@@ -44,7 +44,7 @@ import jax.numpy as jnp
 
 # Point this to the model you just trained
 MODEL_DIR = Path(
-    "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal2/lnn_model2"
+    "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal2/lnn_modelV1"
 )
 CONFIG_PATH = MODEL_DIR / "config.json"
 PARAMS_PATH = MODEL_DIR / "lnn_params.pkl"

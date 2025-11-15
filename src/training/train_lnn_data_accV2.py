@@ -73,25 +73,25 @@ DATA_DIR = Path(
 )
 MANIFEST = DATA_DIR / "double_pendulum_manifest_ideal.json"
 
-OUT_DIR = DATA_DIR / "lnn_model2"
+OUT_DIR = DATA_DIR / "lnn_model_final"
 
 # Use only first 5 seconds of each trajectory
-T_MAX_TRAIN = 5.0
+T_MAX_TRAIN = 10.0
 
 # Downsample stride inside each trajectory (for efficiency)
 STRIDE = 5  # you can change to 2 / 10, etc.
 
 # Training hyperparameters
-BATCH_SIZE = 2048
-N_EPOCHS = 300
-LEARNING_RATE = 3e-4
+BATCH_SIZE = 256
+N_EPOCHS = 250
+LEARNING_RATE = 1e-4
 VAL_SPLIT = 0.2  # 20% for validation
 
 # Model hyperparameters
 INPUT_DIM = 4   # [q1, q2, dq1, dq2]
-HIDDEN_DIM = 512
+HIDDEN_DIM = 256
 OUTPUT_DIM = 1  # scalar Lagrangian
-N_HIDDEN_LAYERS = 4
+N_HIDDEN_LAYERS = 3
 RNG_SEED = 0
 
 # =============================================================
@@ -366,30 +366,69 @@ def main():
         """
         params_ : LNN parameters
         Xn_b    : normalized states (B, 4)
-        Yn_b    : normalized derivatives (B, 4)
+        Yn_b    : normalized derivatives (B, 4) = [dq1, dq2, ddq1, ddq2] (normalized)
 
         We:
-          1) un-normalize X before passing to dynamics,
-          2) run LNN to get physical derivatives,
-          3) normalize predictions,
-          4) compute MSE in normalized space.
+        1) un-normalize X before passing to dynamics,
+        2) run LNN to get physical derivatives,
+        3) normalize predictions,
+        4) compute weighted MSE in normalized space (ddq weighted higher).
         """
         # Un-normalize state
         X_b = Xn_b * X_std + X_mean
+
         # Predict physical derivatives
         preds = predict_derivative_fn(params_, X_b)
+
         # Normalize derivatives
         preds_n = (preds - Y_mean) / Y_std
-        return jnp.mean((preds_n - Yn_b) ** 2)
+
+        # Weight: [dq1, dq2, ddq1, ddq2] → emphasize accelerations a bit more
+        weights = jnp.array([1.0, 1.0, 2.0, 2.0])
+        diff = preds_n - Yn_b
+
+        return jnp.mean(weights * diff**2)
+
 
     # Validation helper (no grad)
-    @jax.jit
-    def val_loss_fn(params_):
-        return loss_fn(params_, X_val_n, Xdot_val_n)
+    
+    def eval_loss_batched(params_, Xn_full, Yn_full, batch_size_eval=4096):
+        """
+        Compute MSE loss over a large dataset in small batches to avoid GPU OOM.
+        Operates entirely in normalized space.
+        """
+        n = Xn_full.shape[0]
+        total_loss = 0.0
+        total_count = 0
+        for start in range(0, n, batch_size_eval):
+            end = min(start + batch_size_eval, n)
+            xb_n = Xn_full[start:end]
+            yb_n = Yn_full[start:end]
+            batch_loss = float(loss_fn(params_, xb_n, yb_n))
+            batch_size_cur = end - start
+            total_loss += batch_loss * batch_size_cur
+            total_count += batch_size_cur
+        return total_loss / max(total_count, 1)
+
 
     # ---------------------- Optimizer ----------------------
-    optimizer = optax.adam(LEARNING_RATE)
+    # Steps per epoch (approx) for scheduler
+    steps_per_epoch = max(1, N_train // BATCH_SIZE)
+
+    # Exponential LR decay: every epoch LR *= 0.98
+    scheduler = optax.exponential_decay(
+        init_value=LEARNING_RATE,
+        transition_steps=steps_per_epoch,
+        decay_rate=0.98,
+        staircase=True,
+    )
+
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),  # gradient clipping for stability
+        optax.adam(scheduler),
+    )
     opt_state = optimizer.init(params)
+
 
     @jax.jit
     def train_step(params_, opt_state_, Xn_b, Yn_b):
@@ -424,7 +463,9 @@ def main():
             epoch_losses.append(float(batch_loss))
 
         train_loss_epoch = float(np.mean(epoch_losses))
-        val_loss_epoch = float(val_loss_fn(params))
+        val_loss_epoch = float(
+            eval_loss_batched(params, X_val_n, Xdot_val_n, batch_size_eval=4096)
+        )
 
         history["train_loss"].append(train_loss_epoch)
         history["val_loss"].append(val_loss_epoch)
@@ -451,8 +492,9 @@ def main():
         return total_loss / max(total_count, 1)
 
     # Use batched evaluation for train loss; val loss reuse existing helper.
-    final_train_loss = eval_loss_batched(params, X_train_n, Xdot_train_n, batch_size_eval=1024)
-    final_val_loss = float(val_loss_fn(params))
+    final_train_loss = eval_loss_batched(params, X_train_n, Xdot_train_n, batch_size_eval=4096)
+    final_val_loss   = eval_loss_batched(params, X_val_n,   Xdot_val_n,   batch_size_eval=4096)
+
 
     print(f"[INFO] Final train loss (batched, normalized): {final_train_loss:.4e}")
     print(f"[INFO] Final val loss (normalized):             {final_val_loss:.4e}")

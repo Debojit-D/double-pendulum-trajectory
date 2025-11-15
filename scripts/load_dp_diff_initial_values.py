@@ -1,5 +1,7 @@
+#!/usr/bin/env python3
 # ------------------------------------------------------------------------------
 # Load & run the Double Pendulum MJCF in MuJoCo viewer
+# OR (if MAKE_VIDEO=True) render a high-resolution MP4 for presentations.
 # - Hardcode initial joint state (q1, q2 in DEGREES -> converted to radians)
 # - Prints a FK sanity check at t=0 (does link-2 use q1+q2 or q1−q2?)
 # ------------------------------------------------------------------------------
@@ -10,7 +12,20 @@ import numpy as np
 import mujoco
 from mujoco.viewer import launch
 
+import imageio.v2 as imageio  # pip install imageio[ffmpeg]
+
 XML_PATH = "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/description/double_pendulum.xml"
+
+# ===================== User flags / knobs =====================
+MAKE_VIDEO   = True    # True: render MP4, False: open interactive viewer
+VIDEO_PATH   = "double_pendulum_presentation.mp4"
+VIDEO_FPS    = 60      # frame rate of output video
+VIDEO_LENGTH = 20.0    # seconds of simulation to record
+# =============================================================
+
+# Offscreen render resolution (good for PPT / 16:9)
+RENDER_WIDTH  = 1080
+RENDER_HEIGHT = 1080
 
 # --------- Hardcoded initial state (DEGREES and RAD/S) ----------
 Q1_DEG = 270.0   # link-1 hanging down if axis="0 1 0" and link geom along +X
@@ -76,9 +91,62 @@ print("=> Matches:", "A (q1+q2)" if err_A < err_B else "B (q1−q2)")
 print("----------------------------------------------------------------\n")
 # ---------------------------------------------------------------------
 
-# Run viewer
-with launch(model, data) as viewer:
-    while viewer.is_running():
-        mujoco.mj_step(model, data)
-        viewer.render()
-        time.sleep(model.opt.timestep)
+
+if MAKE_VIDEO:
+    # ================== OFFSCREEN RENDER TO VIDEO ==================
+    dt = model.opt.timestep
+    total_steps = int(VIDEO_LENGTH / dt)
+
+    # Choose how many sim steps per rendered frame so playback is ~real-time
+    steps_per_frame = max(1, int(round(1.0 / (VIDEO_FPS * dt))))
+    expected_frames = total_steps // steps_per_frame
+
+    print(f"[VIDEO] Rendering {VIDEO_LENGTH:.2f} s "
+          f"({total_steps} sim steps, ~{expected_frames} frames) "
+          f"to {VIDEO_PATH} at {VIDEO_FPS} fps ...")
+
+    # Make sure the offscreen framebuffer is big enough
+    # NOTE: in Python bindings it's 'global_' (not 'global')
+    model.vis.global_.offwidth  = max(model.vis.global_.offwidth,  RENDER_WIDTH)
+    model.vis.global_.offheight = max(model.vis.global_.offheight, RENDER_HEIGHT)
+
+    # Renderer(height, width)  ← note the order!
+    renderer = mujoco.Renderer(model, RENDER_HEIGHT, RENDER_WIDTH)
+    
+    # ---------- Custom camera so the pendulum is centered ----------
+    cam = mujoco.MjvCamera()
+    mujoco.mjv_defaultCamera(cam)
+
+    cam.azimuth   = 90.0    # rotate around vertical axis
+    cam.elevation = -30.0   # tilt down / up
+    cam.distance  = 5.0     # zoom out / in
+
+    # Center the view on the pendulum base (adjust if needed)
+    cam.lookat[:] = [0.0, 0.0, 2.0]   # same z as BASE
+    # ---------------------------------------------------------------
+
+    with imageio.get_writer(VIDEO_PATH, mode="I", fps=VIDEO_FPS) as writer:
+        frame_count = 0
+        for step in range(total_steps):
+            mujoco.mj_step(model, data)
+
+            # Only render every Nth step so that video is ~real-time at VIDEO_FPS
+            if step % steps_per_frame == 0:
+                renderer.update_scene(data, camera=cam)   # use default free camera
+                pixels = renderer.render()    # (H, W, 3) uint8
+                writer.append_data(pixels)
+                frame_count += 1
+
+                if frame_count % max(1, expected_frames // 10) == 0:
+                    print(f"[VIDEO] {100.0 * frame_count / max(1, expected_frames):5.1f}% done")
+
+    print(f"[VIDEO] Done! Saved to {VIDEO_PATH} "
+          f"(frames: {frame_count}, approx duration: {frame_count / VIDEO_FPS:.2f} s)")
+
+else:
+    # ======================= INTERACTIVE VIEWER =======================
+    with launch(model, data) as viewer:
+        while viewer.is_running():
+            mujoco.mj_step(model, data)
+            viewer.render()
+            time.sleep(model.opt.timestep)

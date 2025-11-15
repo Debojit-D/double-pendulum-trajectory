@@ -23,10 +23,10 @@ matplotlib.use("Agg")  # headless-safe
 import matplotlib.pyplot as plt
 
 # ===================== HARD-CODED PATHS / OPTIONS =====================
-MODEL_DIR  = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal1/sindy_model")
-DATA_DIR   = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal1")
-MANIFEST   = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal1/double_pendulum_manifest_ideal.json")
-OUT_DIR    = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal1/sindy_model/eval_all")
+MODEL_DIR  = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal2/sindy_model")
+DATA_DIR   = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal2")
+MANIFEST   = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal2/double_pendulum_manifest_ideal.json")
+OUT_DIR    = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal2/sindy_model/eval_all")
 
 # Which files to evaluate: "manifest_all" | "heldout_only" | "first_k" | "random_k"
 EVAL_MODE     = "heldout_only"
@@ -40,7 +40,7 @@ SIM_ATOL      = 1e-6
 SIM_MAX_STEP  = 0.02        # passed only if your SINDy.simulate supports it
 ANGLE_WRAP    = True        # wrap q to (-pi, pi] for error calc
 ANGLE_IDX     = (0, 1)      # which states are angles
-SAVGOL_WIN    = 31          # for ddq reconstruction (same as train)
+SAVGOL_WIN    = 31          # for ddq reconstruction (same as train if you matched it)
 SAVGOL_ORDER  = 3
 DECIM_STRIDE  = 1           # decimate signals before sim
 BURNIN_SEC    = 0.0         # ignore first seconds when computing RMSE
@@ -88,12 +88,11 @@ def _choose_files(data_dir: Path, manifest: Path, model_dir: Path) -> list[Path]
             except Exception:
                 pass
 
-        # Fallback to metrics.json → holdout_results[].csv (since metrics['heldout_runs'] is often an int)
+        # Fallback to metrics.json → holdout_results[].csv
         met_path = model_dir / "metrics.json"
         if met_path.exists():
             try:
                 m = json.loads(met_path.read_text())
-                # Prefer explicit names if present
                 if isinstance(m.get("heldout_runs", None), list):
                     hr_list = m["heldout_runs"]
                     names = [
@@ -129,27 +128,48 @@ def _choose_files(data_dir: Path, manifest: Path, model_dir: Path) -> list[Path]
 
 
 def _load_model(model_dir: Path) -> SINDyRegressor:
+    """
+    Load a trained SINDy model from MODEL_DIR.
+
+    Important: we must recreate SINDyConfig with the SAME library
+    structure as during training (physics library, angle indices, etc.).
+    Otherwise Theta and coef_ will have incompatible shapes.
+    """
     coef = np.load(model_dir / "coef.npy")
     names = (model_dir / "feature_names.txt").read_text().strip().splitlines()
     cfg_json = json.loads((model_dir / "config.json").read_text())
 
+    # Rebuild config: mirror training-time settings + physics library.
     cfg = SINDyConfig(
         poly_degree=int(cfg_json["poly_degree"]),
         trig_harmonics=int(cfg_json["trig_harmonics"]),
         threshold_lambda=float(cfg_json["threshold_lambda"]),
         max_stlsq_iter=int(cfg_json["max_stlsq_iter"]),
-        use_savgol_for_xdot=False,
+        use_savgol_for_xdot=False,  # we supply Xdot explicitly in training/eval
         savgol_window=int(cfg_json["savgol_window"]),
         savgol_polyorder=int(cfg_json["savgol_polyorder"]),
         normalize_columns=bool(cfg_json["normalize_columns"]),
         include_bias=bool(cfg_json["include_bias"]),
-        backend="numpy",
+        backend="numpy",   # evaluation on CPU is fine and robust
         device=None,
+        # --- physics-aware library flags (MUST match training) ---
+        use_physics_library=True,
+        angle_idx=(0, 1),
     )
+
     model = SINDyRegressor(cfg)
+    # Attach trained parameters + metadata
     model.coef_ = coef
     model.feature_names_ = names
-    model.n_state_ = 4
+    model.n_state_ = 4  # [q1, q2, dq1, dq2]
+
+    # Sanity check: #features must match coef rows
+    if coef.shape[0] != len(names):
+        raise ValueError(
+            f"[LOAD] coef rows ({coef.shape[0]}) != #feature_names ({len(names)}). "
+            "Check that feature_names.txt and coef.npy come from the same training run."
+        )
+
     return model
 
 
@@ -231,10 +251,30 @@ def main():
 
         if MAKE_PLOTS:
             fig = plt.figure(figsize=(11, 8))
-            ax = plt.subplot(2,2,1); ax.plot(th_sim, true_q[:,0], label="q1 true"); ax.plot(th_sim, pred_q[:,0], '--', label="q1 pred"); ax.set_title("q1"); ax.legend()
-            ax = plt.subplot(2,2,2); ax.plot(th_sim, true_q[:,1], label="q2 true"); ax.plot(th_sim, pred_q[:,1], '--', label="q2 pred"); ax.set_title("q2"); ax.legend()
-            ax = plt.subplot(2,2,3); ax.plot(th_sim, Xh[:,2],    label="dq1 true"); ax.plot(th_sim, y[:,2],      '--', label="dq1 pred"); ax.set_title("dq1"); ax.legend()
-            ax = plt.subplot(2,2,4); ax.plot(th_sim, Xh[:,3],    label="dq2 true"); ax.plot(th_sim, y[:,3],      '--', label="dq2 pred"); ax.set_title("dq2"); ax.legend()
+            ax = plt.subplot(2, 2, 1)
+            ax.plot(th_sim, true_q[:, 0], label="q1 true")
+            ax.plot(th_sim, pred_q[:, 0], "--", label="q1 pred")
+            ax.set_title("q1")
+            ax.legend()
+
+            ax = plt.subplot(2, 2, 2)
+            ax.plot(th_sim, true_q[:, 1], label="q2 true")
+            ax.plot(th_sim, pred_q[:, 1], "--", label="q2 pred")
+            ax.set_title("q2")
+            ax.legend()
+
+            ax = plt.subplot(2, 2, 3)
+            ax.plot(th_sim, Xh[:, 2], label="dq1 true")
+            ax.plot(th_sim, y[:, 2], "--", label="dq1 pred")
+            ax.set_title("dq1")
+            ax.legend()
+
+            ax = plt.subplot(2, 2, 4)
+            ax.plot(th_sim, Xh[:, 3], label="dq2 true")
+            ax.plot(th_sim, y[:, 3], "--", label="dq2 pred")
+            ax.set_title("dq2")
+            ax.legend()
+
             fig.suptitle(p.name)
             fig.tight_layout()
             fig.savefig(OUT_DIR / f"{p.stem}_timeseries.png", dpi=160)
@@ -252,9 +292,9 @@ def main():
         mags = np.abs(Xi).sum(axis=1)  # total magnitude across states
         idx = np.argsort(mags)[::-1][:20]
         labels = [model.feature_names_[i] for i in idx]
-        fig = plt.figure(figsize=(12,5))
+        fig = plt.figure(figsize=(12, 5))
         plt.bar(np.arange(len(idx)), mags[idx])
-        plt.xticks(np.arange(len(idx)), labels, rotation=60, ha='right')
+        plt.xticks(np.arange(len(idx)), labels, rotation=60, ha="right")
         plt.title("Top 20 features by |coef| sum across states")
         fig.tight_layout()
         fig.savefig(OUT_DIR / "top_features.png", dpi=160)
@@ -264,6 +304,7 @@ def main():
         print(f"[WARN] feature barplot skipped: {e}")
 
     print(f"[✓] Plots & metrics saved to: {OUT_DIR}")
+
 
 if __name__ == "__main__":
     main()
