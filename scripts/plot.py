@@ -93,7 +93,7 @@ def plot_tip_with_overlay(data, base_relative, out_path=None, show=True):
 
 def main():
     csv_path = sys.argv[1] if len(sys.argv) > 1 else \
-        "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/description/double_pendulum_traj_stiction.csv"
+        "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal1/double_pendulum_traj_ideal_run1956.csv"
     if not os.path.isfile(csv_path):
         print(f"[x] CSV not found: {csv_path}"); sys.exit(1)
 

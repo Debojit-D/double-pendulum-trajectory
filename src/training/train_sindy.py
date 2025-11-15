@@ -9,7 +9,7 @@ Data expected:
 
 State/derivative:
     X    = [q1, q2, dq1, dq2]
-    Xdot = [dq1, dq2, ddq1, ddq2]   (ddq from Savitzky–Golay on dq)
+    Xdot = [dq1, dq2, ddq1, ddq2]   (ddq from Savitzky–Golay on q)
 
 Outputs:
 - out_dir/
@@ -26,7 +26,6 @@ Outputs:
 from __future__ import annotations
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 
@@ -39,14 +38,21 @@ except Exception:
     def tqdm(it, **kwargs):
         return it
 
-# --- Make project root importable so we can import utils.model_training.sindy ---
-PROJECT_ROOT = Path(__file__).resolve().parents[2]  # repo root
 import sys
+
+# --- Make project root importable so we can import utils.model_training.sindy ---
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # repo root (…/double-pendulum-trajectory)
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.model_training.sindy import SINDyRegressor, SINDyConfig  # noqa: E402
 from scipy.signal import savgol_filter  # noqa: E402
+
+
+# ===================== GLOBAL TRAINING HYPERS =====================
+# Hard-coded: only use first 5 seconds of each trajectory (training + eval)
+T_MAX_SECONDS = 5.0
+# ================================================================
 
 
 # ===================== DEFAULTS (safe & robust) =====================
@@ -155,11 +161,11 @@ def _build_X_Xdot_from_csv(csv_path: Path,
                            savgol_polyorder: int,
                            stride: int = 1,
                            debug_dump: Optional[Path] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build X, Xdot, t from one CSV file with strict checks."""
+    """Build X, Xdot, t from one CSV file with strict checks, then clamp to T_MAX_SECONDS."""
     d = _read_csv(csv_path)
     t = d["t"].astype(float)
 
-    # Monotonic t check
+    # Monotonic t check (within this single run)
     if np.any(np.diff(t) <= 0):
         nonmono_idx = int(np.where(np.diff(t) <= 0)[0][0])
         raise ValueError(f"[TIME] Non-monotonic or duplicate t at index {nonmono_idx} in {csv_path}")
@@ -174,7 +180,7 @@ def _build_X_Xdot_from_csv(csv_path: Path,
     if len(t) < 6:
         raise ValueError(f"[LENGTH] {csv_path} too short for SavGol: T={len(t)} (need ≥6)")
 
-    # Derivative: ddq from dq
+    # Derivative: ddq from q (2nd derivative)
     ddq = _estimate_ddq_from_q(q, t, savgol_window, max(3, savgol_polyorder))
 
     # Sanity: no NaN/Inf in raw channels
@@ -189,6 +195,25 @@ def _build_X_Xdot_from_csv(csv_path: Path,
     _ensure_finite(X,    "X",    ctx=f"file={csv_path.name}", dump_dir=debug_dump)
     _ensure_finite(Xdot, "Xdot", ctx=f"file={csv_path.name}", dump_dir=debug_dump)
 
+    # ---- Hard clamp: only keep first T_MAX_SECONDS of this run ----
+    if T_MAX_SECONDS is not None:
+        rel_t = t - t[0]
+        mask = rel_t <= T_MAX_SECONDS
+        if not np.any(mask):
+            raise ValueError(
+                f"[T_MAX] No samples within {T_MAX_SECONDS}s in {csv_path} "
+                f"(t range: {t[0]:.4f}–{t[-1]:.4f})"
+            )
+        t = t[mask]
+        X = X[mask]
+        Xdot = Xdot[mask]
+
+        if len(t) < 6:
+            raise ValueError(
+                f"[T_MAX] After clamping to {T_MAX_SECONDS}s, too few samples in {csv_path} (T={len(t)})"
+            )
+
+    # Downsample (stride) after clamping
     if stride > 1:
         sl = slice(0, None, stride)
         return X[sl], Xdot[sl], t[sl]
@@ -249,7 +274,9 @@ def _load_dataset(
         _ensure_finite(X, "X(file)", ctx=str(p), dump_dir=(debug_dir if debug else None))
         _ensure_finite(Xdot, "Xdot(file)", ctx=str(p), dump_dir=(debug_dir if debug else None))
 
-        X_list.append(X); Xdot_list.append(Xdot); t_list.append(t)
+        X_list.append(X)
+        Xdot_list.append(Xdot)
+        t_list.append(t)
 
     X_all    = np.vstack(X_list)
     Xdot_all = np.vstack(Xdot_list)
@@ -406,6 +433,7 @@ def main():
         print(f"  {k:12s} min={v['min']:+.4e} max={v['max']:+.4e} mean={v['mean']:+.4e} std={v['std']:+.4e}")
     print(f"[INFO] Shapes: X={X.shape}, Xdot={Xdot.shape}, t_all={t_all.shape}")
     print(f"[INFO] t: first={t_all[0]:.6f} last={t_all[-1]:.6f} N={len(t_all)}")
+    print(f"[INFO] Per-run clamp: using only first {T_MAX_SECONDS:.2f}s of each trajectory before concatenation.")
 
     # Configure SINDy
     cfg = SINDyConfig(
@@ -420,7 +448,7 @@ def main():
         include_bias=bool(args.include_bias),
         backend=str(args.backend),
         device=str(args.device) if args.backend == "torch" else None,
-        # --- NEW ---
+        # --- physics-aware library ---
         use_physics_library=True,
         angle_idx=(0, 1),
     )
@@ -589,6 +617,7 @@ def main():
         "backend": cfg.backend,
         "device": cfg.device if cfg.backend == "torch" else None,
         "dataset_stats": _dataset_stats(X, Xdot, name="train"),
+        "t_max_seconds": T_MAX_SECONDS,
     }
 
     if held_out_paths:
@@ -642,7 +671,7 @@ def main():
                     sim_kwargs["method"] = m
                     y_sim = sindy.simulate(x0, th_sim, **sim_kwargs)
                     print(f"[SIM] {p.name}: succeeded with method={m}, "
-                        f"rtol={sim_kwargs['rtol']}, atol={sim_kwargs['atol']}, max_step={sim_kwargs['max_step']}")
+                          f"rtol={sim_kwargs['rtol']}, atol={sim_kwargs['atol']}, max_step={sim_kwargs['max_step']}")
                     break
                 except Exception as e:
                     last_err = e
@@ -654,7 +683,7 @@ def main():
                     np.save(debug_dir / f"heldout_t_{p.name}.npy", th)
                 raise RuntimeError(f"[SIM] simulate() failed on held-out file {p.name}: {last_err}")
 
-            # angle unwrap for error (match periodicity): wrap both true & pred for q
+            # angle wrap for error (match periodicity): wrap both true & pred for q
             true_q = _wrap_to_pi(Xh_sim[:, :2])
             pred_q = _wrap_to_pi(y_sim[:, :2])
 
@@ -714,6 +743,7 @@ def main():
         heldout_runs=[p.name for p in held_out_paths],
         backend=cfg.backend,
         device=cfg.device if cfg.backend == "torch" else None,
+        t_max_seconds=T_MAX_SECONDS,
     )
     (out_dir / "config.json").write_text(json.dumps(config_to_save, indent=2))
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
