@@ -26,7 +26,7 @@ import mujoco
 XML_PATH = "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/description/double_pendulum.xml"
 
 # For clean LNN training, start with REGIME = 1 (ideal)
-REGIME = 1  # 1=IDEAL, 2=VISCOUS, 3=STICTION
+REGIME = 3  # 1=IDEAL, 2=VISCOUS, 3=STICTION
 
 # Preset values (per-DoF)
 DAMPING_VISCOUS = 0.04

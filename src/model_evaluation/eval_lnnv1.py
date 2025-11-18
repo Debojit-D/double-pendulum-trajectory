@@ -14,12 +14,18 @@ Evaluation script for the trained Lagrangian Neural Network (LNN) on double-pend
     * Runs a rollout using simple Euler integration of the LNN dynamics:
           x_{k+1} = x_k + dt * f(x_k)
       and computes RMSE on q and dq versus ground truth.
-    * Saves metrics as CSV + JSON and timeseries plots.
+    * Computes LNN-based energy along:
+          - the ground-truth trajectory
+          - the LNN rollout trajectory
+      and saves them for analysis.
+    * Saves metrics as CSV + JSON, timeseries plots, and per-run timeseries CSVs.
 
 Outputs (in OUT_DIR):
     eval_lnn_metrics.csv
     summary_lnn.json
     <csvstem>_lnn_timeseries.png
+    <csvstem>_lnn_timeseries.csv
+    <csvstem>_lnn_energy.png
 """
 
 from __future__ import annotations
@@ -44,7 +50,7 @@ import jax.numpy as jnp
 
 # Point this to the model you just trained
 MODEL_DIR = Path(
-    "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal2/lnn_model_Final1_5sec"
+    "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleStiction1"
 )
 CONFIG_PATH = MODEL_DIR / "config.json"
 PARAMS_PATH = MODEL_DIR / "lnn_params.pkl"
@@ -57,12 +63,12 @@ OUT_DIR = MODEL_DIR / "eval_lnn"
 
 # How many runs to evaluate
 EVAL_MODE = "first_k"   # "manifest_all" | "first_k" | "random_k"
-K         = 5
+K         = 3
 SHUFFLE_SEED = 42
 
 # Time clamp & stride
 T_MAX_EVAL   = 10.0        # seconds; keep ~ training horizon for fair comparison
-DECIM_STRIDE = 1          # 1 = use all samples
+DECIM_STRIDE = 1           # 1 = use all samples
 
 # Savitzky–Golay fallback (if ddq1/ddq2 not in CSV)
 SAVGOL_WINDOW   = 51
@@ -174,7 +180,7 @@ def _build_X_Xdot_from_csv_for_lnn(csv_path: Path, t_max: float, stride: int):
     q = np.vstack([arr["q1"][mask], arr["q2"][mask]]).T
     dq = np.vstack([arr["dq1"][mask], arr["dq2"][mask]]).T
 
-    # Wrap angles like training
+    # Wrap angles like training (if ANGLE_WRAP was used there)
     q = _wrap_to_pi_np(q)
 
     # ddq from CSV if present, else SavGol
@@ -228,6 +234,46 @@ def _save_summary_json(rows: list[list[object]], out_json: Path):
     out_json.write_text(json.dumps(summary, indent=2))
 
 
+def _save_timeseries_csv(
+    t: np.ndarray,
+    true_q: np.ndarray,
+    true_dq: np.ndarray,
+    pred_q: np.ndarray,
+    pred_dq: np.ndarray,
+    energy_true: np.ndarray,
+    energy_pred: np.ndarray,
+    out_csv: Path,
+):
+    """
+    Save per-run timeseries:
+    t, q_true, dq_true, q_LNN, dq_LNN, E_true(LNN), E_pred(LNN)
+    """
+    data = np.column_stack(
+        [
+            t,
+            true_q[:, 0],
+            true_q[:, 1],
+            true_dq[:, 0],
+            true_dq[:, 1],
+            pred_q[:, 0],
+            pred_q[:, 1],
+            pred_dq[:, 0],
+            pred_dq[:, 1],
+            energy_true,
+            energy_pred,
+        ]
+    )
+    header = (
+        "t,"
+        "q1_true,q2_true,"
+        "dq1_true,dq2_true,"
+        "q1_lnn,q2_lnn,"
+        "dq1_lnn,dq2_lnn,"
+        "E_true_LNN,E_pred_LNN"
+    )
+    np.savetxt(out_csv, data, delimiter=",", header=header, comments="")
+
+
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -250,8 +296,7 @@ def main():
     else:
         manifest = Path(cfg["manifest"]) if cfg.get("manifest") else data_dir / "double_pendulum_manifest_ideal.json"
 
-    # Load normalization (might be needed if you want to normalize inputs before evaluation;
-    # here we evaluate in physical units, but it's nice to have them)
+    # Load normalization (stored for completeness; we evaluate in physical units)
     if norm_cfg is not None:
         X_mean = np.array(norm_cfg["X_mean"], dtype=float)
         X_std  = np.array(norm_cfg["X_std"], dtype=float)
@@ -284,6 +329,19 @@ def main():
         return raw_lagrangian_eom(lag_fn, x)
 
     f_state_vmap = jax.vmap(f_state)
+
+    # LNN energy: E(q, dq) = sum_i dq_i * dL/d(dq_i) - L
+    def _energy_single(x):
+        q = x[:2]
+        q_dot = x[2:]
+
+        def L_wrt_qdot(q_dot_local):
+            return lag_fn(q, q_dot_local)
+
+        dL_dqdot = jax.grad(L_wrt_qdot)(q_dot)
+        return jnp.dot(dL_dqdot, q_dot) - lag_fn(q, q_dot)
+
+    energy_vmap = jax.jit(jax.vmap(_energy_single, in_axes=(0,)))
 
     # Choose subset of files
     files = _choose_files(data_dir, manifest)
@@ -324,8 +382,15 @@ def main():
         true_q = _wrap_to_pi_np(X[:, :2]) if ANGLE_WRAP else X[:, :2]
         pred_q = _wrap_to_pi_np(Y[:, :2]) if ANGLE_WRAP else Y[:, :2]
 
+        true_dq = X[:, 2:]
+        pred_dq = Y[:, 2:]
+
         rmse_q_traj = float(np.sqrt(np.mean((pred_q[k0:] - true_q[k0:]) ** 2)))
-        rmse_dq_traj = float(np.sqrt(np.mean((Y[k0:, 2:] - X[k0:, 2:]) ** 2)))
+        rmse_dq_traj = float(np.sqrt(np.mean((pred_dq[k0:] - true_dq[k0:]) ** 2)))
+
+        # ------ LNN energy along true & rollout trajectories ------
+        energy_true = np.array(energy_vmap(jnp.array(X)))
+        energy_pred = np.array(energy_vmap(jnp.array(Y)))
 
         rows.append([
             p.name,
@@ -344,7 +409,20 @@ def main():
             f"deriv_MSE={deriv_mse:.4e}"
         )
 
-        # ------ Plots ------
+        # ------ Timeseries CSV (for later analysis) ------
+        ts_csv_path = OUT_DIR / f"{p.stem}_lnn_timeseries.csv"
+        _save_timeseries_csv(
+            t=t,
+            true_q=true_q,
+            true_dq=true_dq,
+            pred_q=pred_q,
+            pred_dq=pred_dq,
+            energy_true=energy_true,
+            energy_pred=energy_pred,
+            out_csv=ts_csv_path,
+        )
+
+        # ------ State plots ------
         fig = plt.figure(figsize=(11, 8))
         ax = plt.subplot(2, 2, 1)
         ax.plot(t, true_q[:, 0], label="q1 true")
@@ -357,13 +435,13 @@ def main():
         ax.set_title("q2"); ax.legend()
 
         ax = plt.subplot(2, 2, 3)
-        ax.plot(t, X[:, 2], label="dq1 true")
-        ax.plot(t, Y[:, 2], "--", label="dq1 LNN")
+        ax.plot(t, true_dq[:, 0], label="dq1 true")
+        ax.plot(t, pred_dq[:, 0], "--", label="dq1 LNN")
         ax.set_title("dq1"); ax.legend()
 
         ax = plt.subplot(2, 2, 4)
-        ax.plot(t, X[:, 3], label="dq2 true")
-        ax.plot(t, Y[:, 3], "--", label="dq2 LNN")
+        ax.plot(t, true_dq[:, 1], label="dq2 true")
+        ax.plot(t, pred_dq[:, 1], "--", label="dq2 LNN")
         ax.set_title("dq2"); ax.legend()
 
         fig.suptitle(p.name)
@@ -371,13 +449,26 @@ def main():
         fig.savefig(OUT_DIR / f"{p.stem}_lnn_timeseries.png", dpi=160)
         plt.close(fig)
 
+        # ------ Energy plot ------
+        fig_e = plt.figure(figsize=(7, 4))
+        ax_e = fig_e.add_subplot(1, 1, 1)
+        ax_e.plot(t, energy_true, label="E (LNN on true traj)")
+        ax_e.plot(t, energy_pred, "--", label="E (LNN rollout)")
+        ax_e.set_xlabel("t [s]")
+        ax_e.set_ylabel("Energy (LNN units)")
+        ax_e.set_title(f"Energy – {p.name}")
+        ax_e.legend()
+        fig_e.tight_layout()
+        fig_e.savefig(OUT_DIR / f"{p.stem}_lnn_energy.png", dpi=160)
+        plt.close(fig_e)
+
     # Save metrics + summary
     _save_metrics_csv(rows, OUT_DIR / "eval_lnn_metrics.csv")
     _save_summary_json(rows, OUT_DIR / "summary_lnn.json")
 
     print(f"[✓] Wrote LNN evaluation summary: {OUT_DIR/'eval_lnn_metrics.csv'}")
     print(f"[✓] Wrote LNN aggregate summary:  {OUT_DIR/'summary_lnn.json'}")
-    print(f"[✓] Plots saved in: {OUT_DIR}")
+    print(f"[✓] Per-run timeseries CSVs & plots saved in: {OUT_DIR}")
 
 if __name__ == "__main__":
     main()

@@ -5,20 +5,22 @@ Train a SINDy model on double-pendulum trajectories.
 
 Data expected:
 - CSV columns: t,q1,q2,dq1,dq2,tip_x,tip_y,tip_z,tip_x_rel,tip_z_rel,elbow_x,elbow_z,step_idx
-  (If ddq1,ddq2 also exist from MuJoCo, they are IGNORED in this script.)
+  (If ddq1,ddq2 also exist from MuJoCo, they are PREFERRED; otherwise ddq is reconstructed.)
 
 State/derivative:
     X    = [q1, q2, dq1, dq2]
-    Xdot = [dq1, dq2, ddq1, ddq2]   (ddq is ALWAYS reconstructed from q via Savitzky–Golay)
+    Xdot = [dq1, dq2, ddq1, ddq2]
 
 This script:
 - builds X, Xdot by:
-    * loading t, q1, q2, dq1, dq2
+    * loading t, q1, q2, dq1, dq2 (+ ddq1,ddq2 if present)
     * wrapping q to (-pi,pi] if angle_wrap=True
-    * estimating ddq from q with a 2nd-derivative Savitzky–Golay filter
+    * using MuJoCo ddq1,ddq2 when available; otherwise estimating ddq from q with a 2nd-derivative Savitzky–Golay filter
     * clamping each run to the first T_MAX_SECONDS seconds
 - concatenates all runs (except last K held-out runs)
 - fits SINDy with a physics-aware library (use_physics_library=True, angle_idx=(0,1))
+- after fitting, enforces the kinematic identities d/dt q1 = dq1, d/dt q2 = dq2 if the
+  physics-library velocity features ("dq1", "dq2") are available
 - optionally performs a lambda-sweep to pick the sparsity threshold
 - evaluates on held-out runs via rollout using SINDyRegressor.simulate()
 
@@ -74,7 +76,7 @@ DEFAULTS = {
     "trig_harmonics": 0,       # Keep 0 unless you patch class to support trig–poly cross terms
     # Leave lam=None to enable lambda-sweep below:
     "lam": None,
-    "lambda_sweep": "1e-5,3e-5,1e-4,3e-4,1e-3,3e-3,1e-2",
+    "lambda_sweep": "1e-4,3e-4,1e-3,3e-3,1e-2",
     "savgol_window": 51,
     "savgol_polyorder": 3,
     "angle_wrap": False,
@@ -123,10 +125,10 @@ def _read_csv(csv_path: Path) -> Dict[str, np.ndarray]:
 
     NOTE:
     - We only *require* t, q1, q2, dq1, dq2.
-    - If the CSV also has ddq1, ddq2 from MuJoCo, we IGNORE them.
-      This script always reconstructs ddq from q using Savitzky–Golay.
+    - If the CSV also has ddq1, ddq2 from MuJoCo, they are PREFERRED and will
+      be used directly. If they are absent, ddq is reconstructed from q via Savitzky–Golay.
     """
-    arr = np.genfromtxt(csv_path, delimiter=",", names=True, dtype=float)
+    arr = np.genfromtxt(csv_path, delimiter=",", names=True, dtype=np.float32)
     # Ensure required columns
     for c in REQ_COLS:
         if c not in arr.dtype.names:
@@ -166,7 +168,8 @@ def _estimate_ddq_from_q(q: np.ndarray, t: np.ndarray, win: int, poly: int) -> n
     This is *deliberately* preferred over:
         - finite differences on dq, or
         - directly using logged ddq1, ddq2
-    because it is smoother and keeps training/eval pipelines consistent.
+    when MuJoCo ddq is NOT available, because it is smoother and keeps
+    training/eval pipelines consistent.
     """
     dt = float(np.mean(np.diff(t)))
     if not np.all(np.diff(t) > 0):
@@ -196,28 +199,33 @@ def _build_X_Xdot_from_csv(
     Build X, Xdot, t from one CSV file with strict checks, then clamp to T_MAX_SECONDS.
 
     X    = [q1, q2, dq1, dq2]
-    Xdot = [dq1, dq2, ddq1, ddq2], where ddq is reconstructed from q via Savitzky–Golay.
+    Xdot = [dq1, dq2, ddq1, ddq2]
+           where ddq is taken from MuJoCo (ddq1,ddq2 columns) if present,
+           otherwise reconstructed from q via Savitzky–Golay.
     """
     d = _read_csv(csv_path)
-    t = d["t"].astype(float)
+    t = d["t"].astype(np.float32)
 
     # Monotonic t check (within this single run)
     if np.any(np.diff(t) <= 0):
         nonmono_idx = int(np.where(np.diff(t) <= 0)[0][0])
         raise ValueError(f"[TIME] Non-monotonic or duplicate t at index {nonmono_idx} in {csv_path}")
 
-    q = np.vstack([d["q1"], d["q2"]]).T
-    dq = np.vstack([d["dq1"], d["dq2"]]).T
+    q = np.vstack([d["q1"], d["q2"]]).T.astype(np.float32)
+    dq = np.vstack([d["dq1"], d["dq2"]]).T.astype(np.float32)
+
 
     if angle_wrap:
         q = _wrap_to_pi(q)
 
-    # Check minimum length for SavGol (robust sizing inside)
-    if len(t) < 6:
-        raise ValueError(f"[LENGTH] {csv_path} too short for SavGol: T={len(t)} (need ≥6)")
-
-    # Derivative: ddq from q (2nd derivative, smoother than diff(dq))
-    ddq = _estimate_ddq_from_q(q, t, savgol_window, max(3, savgol_polyorder))
+    # ddq: prefer MuJoCo logs if present, else reconstruct via SavGol
+    if "ddq1" in d and "ddq2" in d:
+        ddq = np.vstack([d["ddq1"], d["ddq2"]]).T.astype(np.float32)
+    else:
+        # Check minimum length for SavGol (robust sizing inside)
+        if len(t) < 6:
+            raise ValueError(f"[LENGTH] {csv_path} too short for SavGol: T={len(t)} (need ≥6)")
+        ddq = _estimate_ddq_from_q(q, t, savgol_window, max(3, savgol_polyorder))
 
     # Sanity: no NaN/Inf in raw channels
     _ensure_finite(q,   "q",   ctx=f"file={csv_path.name}", dump_dir=debug_dump)
@@ -492,10 +500,22 @@ def main():
         include_bias=bool(args.include_bias),
         backend=str(args.backend),
         device=str(args.device) if args.backend == "torch" else None,
-        # --- physics-aware library ---
+
+        # --- physics-aware library for ideal double pendulum ---
         use_physics_library=True,
         angle_idx=(0, 1),
+
+        # For IDEAL regime: no constant drift, no viscous damping.
+        # Keep quadratic + mixed velocity terms, because those appear
+        # in the true double-pendulum dynamics (Coriolis / centrifugal).
+        allow_constant_drift=False,          # kill pure "1" term in ddq
+        allow_linear_damping=True,          # kill pure dq1, dq2 terms
+        allow_quadratic_damping=True,        # allow dq1^2, dq2^2
+        allow_mixed_velocity=True,           # allow dq1*dq2
+        allow_pure_trig_forces=True,         # sin/cos(q1), sin/cos(q2), ...
+        allow_trig_velocity_coupling=True,   # trig(q)*dq, trig(q)*dq^2, ...
     )
+
 
     # Try to instantiate with requested backend; fallback to numpy if torch not available
     try:
@@ -645,6 +665,33 @@ def main():
             f"[FIT] Final fit failed on backend={cfg.backend}. "
             f"Dumped arrays to {debug_dir} (if --debug). Details: {type(e).__name__}: {e}"
         ) from e
+
+    # ---------------------------------------------------------
+    # Enforce kinematic identities: d/dt q1 = dq1, d/dt q2 = dq2
+    # if physics-library velocity features are available.
+    # ---------------------------------------------------------
+    Xi = sindy.coef_
+    idx_dq1 = idx_dq2 = None
+    try:
+        fn = sindy.feature_names_
+        idx_dq1 = fn.index("dq1")
+        idx_dq2 = fn.index("dq2")
+    except (AttributeError, ValueError):
+        pass
+
+    if idx_dq1 is not None and idx_dq2 is not None and Xi.shape[1] >= 2:
+        Xi_mod = Xi.copy()
+        # State ordering is [q1, q2, dq1, dq2] -> columns 0,1 correspond to d/dt q1, d/dt q2
+        Xi_mod[:, 0] = 0.0
+        Xi_mod[idx_dq1, 0] = 1.0
+
+        Xi_mod[:, 1] = 0.0
+        Xi_mod[idx_dq2, 1] = 1.0
+
+        sindy.coef_ = Xi_mod
+        print("[INFO] Enforced d/dt q1 = dq1 and d/dt q2 = dq2 using physics-library features.")
+    else:
+        print("[WARN] Could not enforce dq identities (dq1/dq2 features not found in feature_names).")
 
     # Save model
     np.save(out_dir / "coef.npy", sindy.coef_)

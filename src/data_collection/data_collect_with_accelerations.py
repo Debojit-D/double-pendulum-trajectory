@@ -23,9 +23,9 @@ import mujoco as mj  # alias avoids shadowing issues
 
 # ======================= USER OPTIONS =======================
 XML_PATH     = "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/description/double_pendulum.xml"
-OUTPUT_DIR   = "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal2"
+OUTPUT_DIR   = "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleStiction1"
 
-REGIME       = 1        # 1=IDEAL, 2=VISCOUS, 3=STICTION
+REGIME       = 3        # 1=IDEAL, 2=VISCOUS, 3=STICTION
 N_SAMPLES    = 2000     # how many distinct runs to generate
 SIM_TIME     = 20.0     # seconds per run
 

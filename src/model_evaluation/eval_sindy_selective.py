@@ -4,7 +4,9 @@
 Hard-coded evaluation for the saved SINDy model (double pendulum).
 
 - Loads model from MODEL_DIR
-- Evaluates a chosen subset of CSVs listed in MANIFEST (under DATA_DIR)
+- Evaluates:
+    * first 3 training CSVs
+    * all held-out CSVs
 - Simulates with solve_ivp and computes RMSE(q), RMSE(dq), derivative MSE
 - Saves:
     eval_all/eval_metrics.csv
@@ -17,6 +19,8 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import sys
+import types
+
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # headless-safe
@@ -131,15 +135,24 @@ def _load_model(model_dir: Path) -> SINDyRegressor:
     """
     Load a trained SINDy model from MODEL_DIR.
 
-    Important: we must recreate SINDyConfig with the SAME library
-    structure as during training (physics library, angle indices, etc.).
-    Otherwise Theta and coef_ will have incompatible shapes.
+    Key idea:
+    - Build a *superset* physics library at eval time.
+    - Use feature_names.txt to select the exact subset/ordering
+      used during training, so Theta and coef_ are compatible.
     """
     coef = np.load(model_dir / "coef.npy")
-    names = (model_dir / "feature_names.txt").read_text().strip().splitlines()
+    names_saved = (model_dir / "feature_names.txt").read_text().strip().splitlines()
     cfg_json = json.loads((model_dir / "config.json").read_text())
 
-    # Rebuild config: mirror training-time settings + physics library.
+    if coef.shape[0] != len(names_saved):
+        raise ValueError(
+            f"[LOAD] coef rows ({coef.shape[0]}) != #feature_names ({len(names_saved)}). "
+            "This model directory is inconsistent."
+        )
+
+    # --- Superset library config ---
+    # Use the same core scalars as training (poly/trig/normalization),
+    # but turn ON all physics flags to guarantee a superset of features.
     cfg = SINDyConfig(
         poly_degree=int(cfg_json["poly_degree"]),
         trig_harmonics=int(cfg_json["trig_harmonics"]),
@@ -152,23 +165,58 @@ def _load_model(model_dir: Path) -> SINDyRegressor:
         include_bias=bool(cfg_json["include_bias"]),
         backend="numpy",   # evaluation on CPU is fine and robust
         device=None,
-        # --- physics-aware library flags (MUST match training) ---
+
+        # Physics library: full superset
         use_physics_library=True,
         angle_idx=(0, 1),
+        allow_constant_drift=True,
+        allow_linear_damping=True,
+        allow_quadratic_damping=True,
+        allow_mixed_velocity=True,
+        allow_pure_trig_forces=True,
+        allow_trig_velocity_coupling=True,
     )
 
     model = SINDyRegressor(cfg)
+
+    # ---- Build superset library on a dummy point to figure out column order ----
+    X_dummy = np.zeros((1, 4), dtype=float)  # [q1,q2,dq1,dq2]
+    Theta_full, names_full = model._build_library(X_dummy)
+    n_full = Theta_full.shape[1]
+
+    name_to_idx = {nm: i for i, nm in enumerate(names_full)}
+
+    idxs = []
+    for nm in names_saved:
+        if nm not in name_to_idx:
+            raise ValueError(
+                f"[LOAD] Feature '{nm}' from saved model is not present "
+                f"in current superset library. Check that your SINDy implementation "
+                f"has not changed between training and evaluation."
+            )
+        idxs.append(name_to_idx[nm])
+    idxs = np.array(idxs, dtype=int)
+
+    # For sanity:
+    print(f"[LOAD] Superset features: {n_full}, trained features: {len(names_saved)}")
+    # This should be True now:
+    # len(names_saved) == coef.shape[0] == len(idxs)
+
+    # ---- Monkey-patch _build_library to return only training subset ----
+    orig_build_library = model._build_library
+
+    def _build_library_subset(self, X, _orig=orig_build_library,
+                              _idxs=idxs, _names=names_saved):
+        Theta_full, _ = _orig(X)
+        Theta = Theta_full[:, _idxs]
+        return Theta, _names
+
+    model._build_library = types.MethodType(_build_library_subset, model)
+
     # Attach trained parameters + metadata
     model.coef_ = coef
-    model.feature_names_ = names
+    model.feature_names_ = names_saved
     model.n_state_ = 4  # [q1, q2, dq1, dq2]
-
-    # Sanity check: #features must match coef rows
-    if coef.shape[0] != len(names):
-        raise ValueError(
-            f"[LOAD] coef rows ({coef.shape[0]}) != #feature_names ({len(names)}). "
-            "Check that feature_names.txt and coef.npy come from the same training run."
-        )
 
     return model
 
@@ -198,7 +246,18 @@ def _save_summary_json(rows: list[list[object]], out_json: Path):
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     model = _load_model(MODEL_DIR)
-    files = _choose_files(DATA_DIR, MANIFEST, MODEL_DIR)
+
+    # ---- Build file list: first 3 training runs + all heldout runs ----
+    heldout_files = _choose_files(DATA_DIR, MANIFEST, MODEL_DIR)   # uses EVAL_MODE = "heldout_only"
+    all_files = _collect_files(DATA_DIR, MANIFEST)
+    train_files = [f for f in all_files if f not in heldout_files]
+    extra_train = train_files[:3]   # first 3 training samples
+
+    files: list[Path] = []
+    for f in extra_train + heldout_files:
+        if f not in files:
+            files.append(f)
+
     if not files:
         print("[WARN] No files selected for evaluation.")
         return

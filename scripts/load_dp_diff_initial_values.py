@@ -17,7 +17,7 @@ import imageio.v2 as imageio  # pip install imageio[ffmpeg]
 XML_PATH = "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/description/double_pendulum.xml"
 
 # ===================== User flags / knobs =====================
-MAKE_VIDEO   = True    # True: render MP4, False: open interactive viewer
+MAKE_VIDEO   = False    # True: render MP4, False: open interactive viewer
 VIDEO_PATH   = "double_pendulum_presentation.mp4"
 VIDEO_FPS    = 60      # frame rate of output video
 VIDEO_LENGTH = 20.0    # seconds of simulation to record

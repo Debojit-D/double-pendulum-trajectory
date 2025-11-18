@@ -69,11 +69,11 @@ from utils.model_training.lnn import mlp, raw_lagrangian_eom, custom_init  # noq
 # ===================== HARD-CODED CONFIG =====================
 
 DATA_DIR = Path(
-    "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal2"
+    "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleStiction1"
 )
-MANIFEST = DATA_DIR / "double_pendulum_manifest_ideal.json"
+MANIFEST = DATA_DIR / "double_pendulum_manifest_stiction.json"
 
-OUT_DIR = DATA_DIR / "lnn_modelV1"
+OUT_DIR = DATA_DIR / "lnn_model_stictionV1"
 
 # Use only first 5 seconds of each trajectory
 T_MAX_TRAIN = 5.0

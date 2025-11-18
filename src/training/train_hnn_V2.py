@@ -87,7 +87,7 @@ STRIDE = 5  # e.g. 1 = no stride, 5 = keep every 5th sample
 
 # Training hyperparameters
 BATCH_SIZE = 1024
-N_EPOCHS = 200
+N_EPOCHS = 2000
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 VAL_SPLIT = 0.2  # 20% for validation
@@ -367,7 +367,7 @@ def train_one_model(
     val_loader: DataLoader,
     device: torch.device,
     *,
-    epochs: int = 200,
+    epochs: int = 2000,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     grad_clip: Optional[float] = 1.0,

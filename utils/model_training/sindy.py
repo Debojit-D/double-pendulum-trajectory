@@ -107,6 +107,7 @@ def _trig_features(X: np.ndarray, harmonics: int = 1) -> Tuple[np.ndarray, List[
 class SINDyConfig:
     poly_degree: int = 3
     trig_harmonics: int = 0
+    trig_poly_cross: bool = False         # enable trig × poly cross terms in generic library
     threshold_lambda: float = 1e-3
     max_stlsq_iter: int = 10
     use_savgol_for_xdot: bool = True
@@ -119,9 +120,16 @@ class SINDyConfig:
     device: Optional[str] = None   # e.g., "cuda", "cpu" (only for backend="torch")
     # Debugging / verbosity:
     debug: bool = False
-    # --- NEW ---
+    # Physics-aware basis:
     use_physics_library: bool = False          # turn on to use physics-aware basis
     angle_idx: Tuple[int, ...] = (0, 1)        # which state indices are angles
+    # Physics-library toggles (for mechanical systems like double pendulum)
+    allow_constant_drift: bool = True          # 1
+    allow_linear_damping: bool = True          # dq1, dq2
+    allow_quadratic_damping: bool = True       # dq1^2, dq2^2
+    allow_mixed_velocity: bool = True          # dq1*dq2
+    allow_pure_trig_forces: bool = True        # sin(q), cos(q), etc.
+    allow_trig_velocity_coupling: bool = True  # trig(q) * velocity monomials
 
 
 class SINDyRegressor:
@@ -237,7 +245,7 @@ class SINDyRegressor:
         atol: float = 1e-9,
         method: str = "RK45",
         max_step: float = np.inf,                 # NEW
-        wrap_angles: bool = False,                # NEW
+        wrap_angles: bool = True,                # NEW
         angle_idx: Tuple[int, ...] = (0, 1),      # NEW: which states are angles
         clip_q: Optional[float] = None,           # NEW: clip |q| <= clip_q
         clip_dq: Optional[float] = None,          # NEW: clip |dq| <= clip_dq
@@ -360,21 +368,27 @@ class SINDyRegressor:
         return Xdot
 
     def _build_library(self, X: np.ndarray) -> Tuple[np.ndarray, List[str]]:
-        # NEW: prefer physics-aware library if requested
+        # Prefer physics-aware library if requested
         if getattr(self.cfg, "use_physics_library", False):
             Theta, names = self._build_physics_library(X)
             if self.cfg.debug:
                 self._debug_check_np("Theta (physics)", Theta)
             return Theta, names
 
-        # Original polynomial/trig path (unchanged)
+        # Original polynomial/trig path, now with optional trig × poly cross terms
         poly_deg = max(self.cfg.poly_degree, 0)
-        Theta_list = []
+        Theta_list: List[np.ndarray] = []
         names: List[str] = []
 
         if self.cfg.include_bias:
-            Theta_list.append(np.ones((X.shape[0], 1), dtype=X.dtype))
+            bias = np.ones((X.shape[0], 1), dtype=X.dtype)
+            Theta_list.append(bias)
             names.append("1")
+
+        Theta_poly: Optional[np.ndarray] = None
+        names_poly: List[str] = []
+        Theta_trig: Optional[np.ndarray] = None
+        names_trig: List[str] = []
 
         if poly_deg > 0:
             Theta_poly, names_poly = _poly_features(X, poly_deg, include_bias=False)
@@ -386,6 +400,29 @@ class SINDyRegressor:
             Theta_list.append(Theta_trig)
             names.extend(names_trig)
 
+        # Optional trig × poly cross terms (generic path)
+        if (
+            self.cfg.trig_poly_cross
+            and Theta_poly is not None
+            and Theta_trig is not None
+            and Theta_poly.shape[1] > 0
+            and Theta_trig.shape[1] > 0
+        ):
+            cross_feats: List[np.ndarray] = []
+            cross_names: List[str] = []
+            for i, tname in enumerate(names_trig):
+                tcol = Theta_trig[:, i:i+1]
+                for j, pname in enumerate(names_poly):
+                    pcol = Theta_poly[:, j:j+1]
+                    cross_feats.append(tcol * pcol)
+                    cross_names.append(f"{tname}*{pname}")
+            if cross_feats:
+                Theta_cross = np.hstack(cross_feats)
+                Theta_list.append(Theta_cross)
+                names.extend(cross_names)
+                if self.cfg.debug:
+                    print(f"[SINDy._build_library] Added trig×poly cross terms: {len(cross_names)} columns.")
+
         if not Theta_list:
             return np.zeros((X.shape[0], 0), dtype=X.dtype), []
         Theta = np.hstack(Theta_list)
@@ -393,21 +430,32 @@ class SINDyRegressor:
             self._debug_check_np("Theta", Theta)
         return Theta, names
 
-    
-    
     def _build_physics_library(self, X: np.ndarray) -> Tuple[np.ndarray, List[str]]:
         """
-        Compact physics-aware Θ(X):
-          Features: 1, {dq1,dq2,dq1^2,dq2^2,dq1*dq2},
-                    {sin(q1),cos(q1),sin(q2),cos(q2),sin(q1-q2),cos(q1-q2)},
-                    (each of those 6 trig terms) × (the 5 velocity monomials above).
-        Assumes state ordering [q1,q2,dq1,dq2] and angle_idx=(0,1).
+        Physics-aware Θ(X) for a double pendulum with state [q1, q2, dq1, dq2].
+
+        Controlled by SINDyConfig physics toggles:
+
+          - allow_constant_drift:
+                include bias term 1
+          - allow_linear_damping:
+                include dq1, dq2
+          - allow_quadratic_damping:
+                include dq1^2, dq2^2
+          - allow_mixed_velocity:
+                include dq1*dq2
+          - allow_pure_trig_forces:
+                include sin/cos of q1, q2, q1±q2
+          - allow_trig_velocity_coupling:
+                include [above trig] × [velocity monomials]
+
+        Assumes state ordering [q1, q2, dq1, dq2] and angle_idx=(0,1).
         """
         X = np.asarray(X, dtype=float)
         nT, nS = X.shape
         ai = tuple(self.cfg.angle_idx)
         if len(ai) != 2:
-            raise ValueError("angle_idx must contain exactly two indices for (q1,q2).")
+            raise ValueError("angle_idx must contain exactly two indices for (q1,q2) in physics_library.")
 
         # Map indices
         q1, q2 = X[:, ai[0]], X[:, ai[1]]
@@ -415,44 +463,71 @@ class SINDyRegressor:
         # Heuristic: velocities are the other two cols (works for [q1,q2,dq1,dq2])
         vel_idx = [i for i in range(nS) if i not in ai]
         if len(vel_idx) != 2:
-            raise ValueError("Expected 2 velocity columns besides angle_idx.")
+            raise ValueError("Expected exactly 2 velocity columns besides angle_idx for physics_library.")
         dq1, dq2 = X[:, vel_idx[0]], X[:, vel_idx[1]]
 
-        # Trig building blocks
-        s1, c1  = np.sin(q1), np.cos(q1)
-        s2, c2  = np.sin(q2), np.cos(q2)
-        s12     = np.sin(q1 - q2)
-        c12     = np.cos(q1 - q2)
+        feats: List[np.ndarray] = []
+        names: List[str] = []
 
-        feats, names = [], []
-        def add(col, nm): feats.append(col[:, None]); names.append(nm)
+        def add(col: np.ndarray, nm: str):
+            feats.append(col[:, None])
+            names.append(nm)
 
-        # bias
-        add(np.ones_like(q1), "1")
+        # --- 1) Optional bias ---
+        if self.cfg.allow_constant_drift:
+            add(np.ones_like(q1), "1")
 
-        # velocity monomials
-        add(dq1, "dq1"); add(dq2, "dq2")
-        add(dq1*dq2, "dq1*dq2")
-        add(dq1**2, "dq1^2"); add(dq2**2, "dq2^2")
+        # --- 2) Velocity monomials (no trig yet) ---
+        vel_basis: List[Tuple[str, np.ndarray]] = []
+        if self.cfg.allow_linear_damping:
+            vel_basis.extend([
+                ("dq1", dq1),
+                ("dq2", dq2),
+            ])
+        if self.cfg.allow_mixed_velocity:
+            vel_basis.append(("dq1*dq2", dq1 * dq2))
+        if self.cfg.allow_quadratic_damping:
+            vel_basis.extend([
+                ("dq1^2", dq1 ** 2),
+                ("dq2^2", dq2 ** 2),
+            ])
 
-        # pure trig
-        trig_list = [("sin(q1)", s1), ("cos(q1)", c1),
-                     ("sin(q2)", s2), ("cos(q2)", c2),
-                     ("sin(q1-q2)", s12), ("cos(q1-q2)", c12)]
-        for nm, val in trig_list:
+        for nm, val in vel_basis:
             add(val, nm)
 
-        # trig × velocity monomials
-        vel_basis = [("dq1", dq1), ("dq2", dq2),
-                     ("dq1^2", dq1**2), ("dq2^2", dq2**2), ("dq1*dq2", dq1*dq2)]
-        for tnm, tval in trig_list:
-            for vnm, vval in vel_basis:
-                add(tval * vval, f"{tnm}*{vnm}")
+        # --- 3) Trig terms in angles ---
+        trig_list: List[Tuple[str, np.ndarray]] = []
+        if self.cfg.allow_pure_trig_forces or self.cfg.allow_trig_velocity_coupling:
+            s1, c1  = np.sin(q1), np.cos(q1)
+            s2, c2  = np.sin(q2), np.cos(q2)
+            s12     = np.sin(q1 - q2)
+            c12     = np.cos(q1 - q2)
+            sp      = np.sin(q1 + q2)
+            cp      = np.cos(q1 + q2)
 
-        Theta = np.hstack(feats)
+            trig_list = [
+                ("sin(q1)", s1),      ("cos(q1)", c1),
+                ("sin(q2)", s2),      ("cos(q2)", c2),
+                ("sin(q1-q2)", s12),  ("cos(q1-q2)", c12),
+                ("sin(q1+q2)", sp),   ("cos(q1+q2)", cp),
+            ]
+
+        # Add pure trig (potential-like) forces
+        if self.cfg.allow_pure_trig_forces:
+            for nm, val in trig_list:
+                add(val, nm)
+
+        # --- 4) Trig × velocity monomials (Coriolis / inertial coupling style) ---
+        if self.cfg.allow_trig_velocity_coupling and vel_basis and trig_list:
+            for tnm, tval in trig_list:
+                for vnm, vval in vel_basis:
+                    add(tval * vval, f"{tnm}*{vnm}")
+
+        if feats:
+            Theta = np.hstack(feats)
+        else:
+            Theta = np.zeros((nT, 0), dtype=float)
         return Theta, names
-
-
 
     # ---- STLSQ backends ----
 

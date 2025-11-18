@@ -14,11 +14,14 @@ Evaluation script for the trained Lagrangian Neural Network (LNN) on double-pend
     * Runs a rollout using simple Euler integration of the LNN dynamics:
           x_{k+1} = x_k + dt * f(x_k)
       and computes RMSE on q and dq versus ground truth.
+    * Measures per-run inference time.
     * Saves metrics as CSV + JSON and timeseries plots.
 
 Outputs (in OUT_DIR):
     eval_lnn_metrics.csv
     summary_lnn.json
+    best_25_runs.(csv|json)
+    worst_10_runs.(csv|json)
     <csvstem>_lnn_timeseries.png
 """
 
@@ -27,6 +30,7 @@ from pathlib import Path
 import json
 import sys
 import math
+import time
 
 import numpy as np
 from scipy.signal import savgol_filter
@@ -53,16 +57,16 @@ PARAMS_PATH = MODEL_DIR / "lnn_params.pkl"
 DATA_DIR_OVERRIDE = None  # e.g. Path(".../SampleIdeal2") or None to use config
 MANIFEST_OVERRIDE = None  # or Path(".../double_pendulum_manifest_ideal.json")
 
-OUT_DIR = MODEL_DIR / "eval_lnn"
+OUT_DIR = MODEL_DIR / "eval_lnn2"
 
 # How many runs to evaluate
-EVAL_MODE = "first_k"   # "manifest_all" | "first_k" | "random_k"
+EVAL_MODE = "manifest_all"   # "manifest_all" | "first_k" | "random_k"
 K         = 5
 SHUFFLE_SEED = 42
 
 # Time clamp & stride
 T_MAX_EVAL   = 10.0        # seconds; keep ~ training horizon for fair comparison
-DECIM_STRIDE = 1          # 1 = use all samples
+DECIM_STRIDE = 1           # 1 = use all samples
 
 # Savitzky–Golay fallback (if ddq1/ddq2 not in CSV)
 SAVGOL_WINDOW   = 51
@@ -197,7 +201,10 @@ def _build_X_Xdot_from_csv_for_lnn(csv_path: Path, t_max: float, stride: int):
 
 
 def _save_metrics_csv(rows: list[list[object]], out_csv: Path):
-    header = "csv,rmse_q_traj,rmse_dq_traj,deriv_mse,deriv_rmse_dq,deriv_rmse_ddq,steps"
+    header = (
+        "csv,rmse_q_traj,rmse_dq_traj,deriv_mse,"
+        "deriv_rmse_dq,deriv_rmse_ddq,steps,inference_time_sec"
+    )
     arr = np.array(rows, dtype=object)
     np.savetxt(out_csv, arr, fmt="%s", delimiter=",", header=header, comments="")
 
@@ -211,6 +218,7 @@ def _save_summary_json(rows: list[list[object]], out_json: Path):
     vals_dm  = np.array([float(r[3]) for r in rows])
     vals_dm_dq  = np.array([float(r[4]) for r in rows])
     vals_dm_ddq = np.array([float(r[5]) for r in rows])
+    vals_time   = np.array([float(r[7]) for r in rows])
 
     summary = dict(
         count=len(rows),
@@ -224,8 +232,39 @@ def _save_summary_json(rows: list[list[object]], out_json: Path):
         deriv_rmse_dq_median=float(np.median(vals_dm_dq)),
         deriv_rmse_ddq_mean=float(vals_dm_ddq.mean()),
         deriv_rmse_ddq_median=float(np.median(vals_dm_ddq)),
+        inference_time_sec_mean=float(vals_time.mean()),
+        inference_time_sec_median=float(np.median(vals_time)),
     )
     out_json.write_text(json.dumps(summary, indent=2))
+
+
+def _save_subset(rows: list[list[object]], out_csv: Path, out_json: Path):
+    """Save a subset of rows (already filtered/sorted) to CSV + JSON."""
+    _save_metrics_csv(rows, out_csv)
+    # build list of dicts for JSON
+    keys = [
+        "csv",
+        "rmse_q_traj",
+        "rmse_dq_traj",
+        "deriv_mse",
+        "deriv_rmse_dq",
+        "deriv_rmse_ddq",
+        "steps",
+        "inference_time_sec",
+    ]
+    dict_rows = []
+    for r in rows:
+        d = {k: r[i] for i, k in enumerate(keys)}
+        # cast numeric strings to float/int for nicer JSON
+        d["rmse_q_traj"] = float(d["rmse_q_traj"])
+        d["rmse_dq_traj"] = float(d["rmse_dq_traj"])
+        d["deriv_mse"] = float(d["deriv_mse"])
+        d["deriv_rmse_dq"] = float(d["deriv_rmse_dq"])
+        d["deriv_rmse_ddq"] = float(d["deriv_rmse_ddq"])
+        d["steps"] = int(d["steps"])
+        d["inference_time_sec"] = float(d["inference_time_sec"])
+        dict_rows.append(d)
+    out_json.write_text(json.dumps(dict_rows, indent=2))
 
 
 def main():
@@ -250,8 +289,7 @@ def main():
     else:
         manifest = Path(cfg["manifest"]) if cfg.get("manifest") else data_dir / "double_pendulum_manifest_ideal.json"
 
-    # Load normalization (might be needed if you want to normalize inputs before evaluation;
-    # here we evaluate in physical units, but it's nice to have them)
+    # Load normalization (not directly used for metrics, but kept for completeness)
     if norm_cfg is not None:
         X_mean = np.array(norm_cfg["X_mean"], dtype=float)
         X_std  = np.array(norm_cfg["X_std"], dtype=float)
@@ -292,9 +330,11 @@ def main():
         return
 
     print(f"[INFO] Evaluating LNN on {len(files)} runs.")
-    rows = []
+    rows: list[list[object]] = []
 
     for p in files:
+        t_start = time.perf_counter()
+
         X, Xdot, t = _build_X_Xdot_from_csv_for_lnn(
             p, t_max=T_MAX_EVAL, stride=max(1, DECIM_STRIDE)
         )
@@ -327,6 +367,9 @@ def main():
         rmse_q_traj = float(np.sqrt(np.mean((pred_q[k0:] - true_q[k0:]) ** 2)))
         rmse_dq_traj = float(np.sqrt(np.mean((Y[k0:, 2:] - X[k0:, 2:]) ** 2)))
 
+        t_end = time.perf_counter()
+        inference_time = t_end - t_start
+
         rows.append([
             p.name,
             rmse_q_traj,
@@ -335,13 +378,15 @@ def main():
             deriv_rmse_dq,
             deriv_rmse_ddq,
             N,
+            inference_time,
         ])
 
         print(
             f"[EVAL LNN] {p.name}: "
             f"traj_RMSE(q)={rmse_q_traj:.4e}, "
             f"traj_RMSE(dq)={rmse_dq_traj:.4e}, "
-            f"deriv_MSE={deriv_mse:.4e}"
+            f"deriv_MSE={deriv_mse:.4e}, "
+            f"time={inference_time:.3f}s"
         )
 
         # ------ Plots ------
@@ -371,13 +416,42 @@ def main():
         fig.savefig(OUT_DIR / f"{p.stem}_lnn_timeseries.png", dpi=160)
         plt.close(fig)
 
-    # Save metrics + summary
-    _save_metrics_csv(rows, OUT_DIR / "eval_lnn_metrics.csv")
-    _save_summary_json(rows, OUT_DIR / "summary_lnn.json")
+    # --------------------------------------------------
+    # Save metrics + aggregate summary
+    # --------------------------------------------------
+    metrics_csv = OUT_DIR / "eval_lnn_metrics.csv"
+    summary_json = OUT_DIR / "summary_lnn.json"
 
-    print(f"[✓] Wrote LNN evaluation summary: {OUT_DIR/'eval_lnn_metrics.csv'}")
-    print(f"[✓] Wrote LNN aggregate summary:  {OUT_DIR/'summary_lnn.json'}")
+    _save_metrics_csv(rows, metrics_csv)
+    _save_summary_json(rows, summary_json)
+
+    # --------------------------------------------------
+    # Best 25 / worst 10 (by rmse_q_traj)
+    # --------------------------------------------------
+    if rows:
+        # sort ascending by rmse_q_traj (index 1)
+        rows_sorted = sorted(rows, key=lambda r: float(r[1]))
+        best_25 = rows_sorted[: min(25, len(rows_sorted))]
+        worst_10 = rows_sorted[-min(10, len(rows_sorted)) :]
+
+        _save_subset(
+            best_25,
+            OUT_DIR / "best_25_runs.csv",
+            OUT_DIR / "best_25_runs.json",
+        )
+        _save_subset(
+            worst_10,
+            OUT_DIR / "worst_10_runs.csv",
+            OUT_DIR / "worst_10_runs.json",
+        )
+
+        print(f"[✓] Saved best 25 runs to:   {OUT_DIR/'best_25_runs.csv'}")
+        print(f"[✓] Saved worst 10 runs to:  {OUT_DIR/'worst_10_runs.csv'}")
+
+    print(f"[✓] Wrote LNN evaluation summary: {metrics_csv}")
+    print(f"[✓] Wrote LNN aggregate summary:  {summary_json}")
     print(f"[✓] Plots saved in: {OUT_DIR}")
+
 
 if __name__ == "__main__":
     main()
