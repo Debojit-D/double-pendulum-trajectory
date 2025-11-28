@@ -43,15 +43,20 @@ import jax.numpy as jnp
 # ------------------------------------------------------------------
 
 # Point this to the model you just trained
+
+# Point this to the model you just trained
 MODEL_DIR = Path(
-    "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal2/lnn_model_Final1_5sec"
+    "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleStiction1/lnn_model_stictionV1"
 )
 CONFIG_PATH = MODEL_DIR / "config.json"
 PARAMS_PATH = MODEL_DIR / "lnn_params.pkl"
 
-# We will read DATA_DIR + MANIFEST from config.json, but you can override:
-DATA_DIR_OVERRIDE = None  # e.g. Path(".../SampleIdeal2") or None to use config
-MANIFEST_OVERRIDE = None  # or Path(".../double_pendulum_manifest_ideal.json")
+# If your data CSVs are directly in SampleStiction1, you can optionally do:
+DATA_DIR_OVERRIDE = Path(
+    "/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleStiction1"
+)
+# or leave as None if config.json already points to the correct data_dir
+MANIFEST_OVERRIDE = None
 
 OUT_DIR = MODEL_DIR / "eval_lnn"
 

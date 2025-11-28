@@ -27,10 +27,10 @@ matplotlib.use("Agg")  # headless-safe
 import matplotlib.pyplot as plt
 
 # ===================== HARD-CODED PATHS / OPTIONS =====================
-MODEL_DIR  = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal2/sindy_model")
-DATA_DIR   = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal2")
-MANIFEST   = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal2/double_pendulum_manifest_ideal.json")
-OUT_DIR    = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal2/sindy_model/eval_all")
+MODEL_DIR  = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal1/sindy_model")
+DATA_DIR   = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal1")
+MANIFEST   = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal1/double_pendulum_manifest_ideal.json")
+OUT_DIR    = Path("/home/iitgn-robotics/Debojit_WS/double-pendulum-trajectory/data/SampleIdeal1/sindy_model/eval_all")
 
 # Which files to evaluate: "manifest_all" | "heldout_only" | "first_k" | "random_k"
 EVAL_MODE     = "heldout_only"
